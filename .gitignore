@@ -1,0 +1,14 @@
+.daml/
+*.dar
+!dars/*.dar
+evidence-store/
+connector/**/node_modules/
+connector/**/dist/
+connector/**/coverage/
+.idea/
+.vscode/
+*.log
+.env
+.env.local
+__pycache__/
+.DS_Store

@@ -1,0 +1,164 @@
+module Operators where
+
+import DA.Text qualified as T
+import DA.Time (RelTime, addRelTime)
+import Config (SystemConfig, fetchParams)
+import Vault
+import Attestations
+
+-- | Operator role types.
+data OperatorType =
+    VaultKeeper
+  | Weighmaster
+  | WeighDevice
+  | Assayer
+  | Transporter
+  | Auditor
+  | NavAgent
+  | ComplianceProvider
+  | OracleOperator
+  deriving (Eq, Show)
+
+-- | Permissions covering every attestation kind and workflow action.
+data Permission =
+    AttestPresence
+  | AttestWeight
+  | AttestPurity
+  | AttestMovement
+  | AttestAuditResult
+  | AttestInsuranceStatus
+  | ManageVault
+  | PublishNav
+  | PublishOracle
+  | RunCompliance
+  deriving (Eq, Show)
+
+-- | TOTAL mapping: AttestationKind -> Permission.
+-- No wildcard — adding a kind without a case is a compile error.
+permissionFor : AttestationKind -> Permission
+permissionFor Presence = AttestPresence
+permissionFor Weight = AttestWeight
+permissionFor Purity = AttestPurity
+permissionFor Movement = AttestMovement
+permissionFor AuditResult = AttestAuditResult
+permissionFor InsuranceStatus = AttestInsuranceStatus
+
+defaultPermissions : OperatorType -> [Permission]
+defaultPermissions VaultKeeper = [ManageVault, AttestPresence]
+defaultPermissions Weighmaster = [AttestWeight]
+defaultPermissions WeighDevice = [AttestWeight]
+defaultPermissions Assayer = [AttestPurity]
+defaultPermissions Transporter = [AttestMovement]
+defaultPermissions Auditor = [AttestAuditResult]
+defaultPermissions NavAgent = [PublishNav]
+defaultPermissions ComplianceProvider = [RunCompliance]
+defaultPermissions OracleOperator = [PublishOracle]
+
+template OperatorRole
+  with
+    custodian : Party
+    operator : Party
+    role : OperatorType
+    site : Text
+    permissions : [Permission]
+    validUntil : Time
+  where
+    signatory custodian
+    observer operator
+
+    choice Revoke : ()
+      controller custodian
+      do pure ()
+
+    nonconsuming choice SubmitAttestation : (ContractId Attestation, ContractId AttestationIndex)
+      with
+        indexCid : ContractId AttestationIndex
+        barSerial : Text
+        payload : AttestationPayload
+        evidenceHash : Text
+        deviceId : Optional Text
+      controller operator
+      do
+        now <- getTime
+        assertMsg "OperatorRole expired" (now <= validUntil)
+        let kind = kindOf payload
+        let needed = permissionFor kind
+        assertMsg ("Permission mismatch: role lacks " <> show needed)
+          (needed `elem` permissions)
+        assertMsg "evidenceHash must be non-empty" (T.length evidenceHash > 0)
+        attCid <- create Attestation with
+          attestor = operator
+          custodian
+          barSerial
+          kind
+          payload
+          evidenceHash
+          deviceId
+          attestedAt = now
+        newIdx <- exercise indexCid UpsertAttestation with
+          serial = barSerial
+          kind
+          attCid
+          attestedAt = now
+        pure (attCid, newIdx)
+
+template CustodianRole
+  with
+    custodian : Party
+    regulator : Party
+    configCid : ContractId SystemConfig
+    registryCid : ContractId SerialRegistry
+    indexCid : ContractId AttestationIndex
+  where
+    signatory custodian
+    observer regulator
+
+    nonconsuming choice AppointOperator : ContractId OperatorRole
+      with
+        operator : Party
+        role : OperatorType
+        site : Text
+        permissions : [Permission]
+        validFor : RelTime
+      controller custodian
+      do
+        now <- getTime
+        create OperatorRole with
+          custodian
+          operator
+          role
+          site
+          permissions
+          validUntil = addRelTime now validFor
+
+    nonconsuming choice RegisterBar : (ContractId GoldBar, ContractId SerialRegistry, ContractId VaultReceipt)
+      with
+        registryCid : ContractId SerialRegistry
+        serialNumber : Text
+        weightGrams : Decimal
+        purity : Decimal
+        vaultLocation : Text
+        custodianRef : Text
+      controller custodian
+      do
+        params <- fetchParams configCid
+        -- Purity validated here (not in GoldBar.ensure) because ensure cannot fetch config.
+        assertMsg "Purity below SystemConfig.minPurity" (purity >= params.minPurity)
+        assertMsg "weightGrams must be positive" (weightGrams > 0.0)
+        newReg <- exercise registryCid AddSerial with serial = serialNumber
+        barCid <- create GoldBar with
+          custodian
+          regulator
+          serialNumber
+          weightGrams
+          purity
+          vaultLocation
+          custodianRef
+        now <- getTime
+        receiptCid <- create VaultReceipt with
+          custodian
+          regulator
+          barCid
+          serialNumber
+          attestedAt = now
+        pure (barCid, newReg, receiptCid)

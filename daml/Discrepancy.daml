@@ -1,0 +1,132 @@
+module Discrepancy where
+
+import DA.Text qualified as T
+import Attestations (Attestation, AttestationKind(..), AttestationPayload(..))
+import Operators (OperatorRole, OperatorType(..))
+import Token
+
+template DiscrepancyReport
+  with
+    custodian : Party
+    auditor : Party
+    vaultSite : Text
+    affectedSerials : [Text]
+    auditAttestationCid : ContractId Attestation
+    rationale : Text
+    resolved : Bool
+  where
+    signatory custodian, auditor
+
+    ensure length affectedSerials > 0 && T.length rationale > 0
+
+    choice MarkResolved : ContractId DiscrepancyReport
+      controller custodian, auditor
+      do create this with resolved = True
+
+    -- | Joint write-down: custodian + auditor burn/haircut a holding.
+    choice WriteDown : (ContractId IssuanceLedger, Optional (ContractId GoldHolding))
+      with
+        holdingCid : ContractId GoldHolding
+        ledgerCid : ContractId IssuanceLedger
+        serial : Text
+        burnGrams : Decimal
+        discrepancyIndexCid : ContractId DiscrepancyIndex
+      controller custodian, auditor
+      do
+        assertMsg "Serial must be affected" (serial `elem` affectedSerials)
+        holding <- fetch holdingCid
+        assertMsg "Holding issuer must be custodian" (holding.issuer == custodian)
+        result <- if burnGrams >= holding.amountGrams then do
+            nl <- exercise holdingCid BurnGold with ledgerCid, serial
+            pure (nl, None)
+          else do
+            (remaining, nl) <- exercise holdingCid HaircutGold with ledgerCid, serial, burnGrams
+            pure (nl, Some remaining)
+        _ <- create this with resolved = True
+        _ <- exercise discrepancyIndexCid MarkEntryResolved with reportCid = self
+        pure result
+
+    -- | Resolve requiring a fresh Presence attestation for an affected serial.
+    choice Resolve : ContractId DiscrepancyReport
+      with
+        presenceAttCid : ContractId Attestation
+        discrepancyIndexCid : ContractId DiscrepancyIndex
+      controller custodian, auditor
+      do
+        att <- fetch presenceAttCid
+        assertMsg "Must be Presence attestation" (att.kind == Presence)
+        assertMsg "Presence serial must be affected" (att.barSerial `elem` affectedSerials)
+        assertMsg "Presence must show present" (
+          case att.payload of
+            PresencePayload p -> p
+            _ -> False)
+        newReport <- create this with resolved = True
+        _ <- exercise discrepancyIndexCid MarkEntryResolved with reportCid = self
+        pure newReport
+
+-- | Open discrepancy tracker per vault site (keyless index pattern).
+template DiscrepancyIndex
+  with
+    custodian : Party
+    entries : [(Text, ContractId DiscrepancyReport, Bool)]
+    observers : [Party]
+  where
+    signatory custodian
+    observer observers
+
+    choice RegisterDiscrepancy : ContractId DiscrepancyIndex
+      with
+        site : Text
+        reportCid : ContractId DiscrepancyReport
+      controller custodian
+      do
+        create this with entries = (site, reportCid, False) :: entries
+
+    choice MarkEntryResolved : ContractId DiscrepancyIndex
+      with
+        reportCid : ContractId DiscrepancyReport
+      controller custodian
+      do
+        let updated = map (\(s, c, r) -> if c == reportCid then (s, c, True) else (s, c, r)) entries
+        create this with entries = updated
+
+hasOpenDiscrepancy : DiscrepancyIndex -> Text -> Bool
+hasOpenDiscrepancy idx site =
+  any (\(s, _, resolved) -> s == site && not resolved) idx.entries
+
+-- | Create a discrepancy report; only Auditor OperatorRole may file.
+template AuditorAuthority
+  with
+    custodian : Party
+    auditor : Party
+    roleCid : ContractId OperatorRole
+    discrepancyIndexCid : ContractId DiscrepancyIndex
+  where
+    signatory custodian
+    observer auditor
+
+    nonconsuming choice FileDiscrepancy : (ContractId DiscrepancyReport, ContractId DiscrepancyIndex)
+      with
+        vaultSite : Text
+        affectedSerials : [Text]
+        auditAttestationCid : ContractId Attestation
+        rationale : Text
+      controller auditor
+      do
+        role <- fetch roleCid
+        assertMsg "Only Auditor may file discrepancy" (role.role == Auditor)
+        assertMsg "Auditor party mismatch" (role.operator == auditor)
+        att <- fetch auditAttestationCid
+        assertMsg "Must reference AuditResult attestation" (att.kind == AuditResult)
+        reportCid <- create DiscrepancyReport with
+          custodian
+          auditor
+          vaultSite
+          affectedSerials
+          auditAttestationCid
+          rationale
+          resolved = False
+        newIdx <- exercise discrepancyIndexCid RegisterDiscrepancy with
+          site = vaultSite
+          reportCid
+        pure (reportCid, newIdx)

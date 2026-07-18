@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Minimal, project-local subset of an ISO 20022 setr.012-shaped subscription
+  order confirmation, as implemented by connector/iso20022-adapter. This is
+  NOT the official ISO 20022 setr.012.001.xx schema; see ../SCHEMA.md for the
+  exact field subset and rationale.
+-->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           xmlns="urn:gold-custody:iso20022:setr.012.subset:1"
+           targetNamespace="urn:gold-custody:iso20022:setr.012.subset:1"
+           elementFormDefault="qualified">
+
+  <xs:element name="Document" type="DocumentType"/>
+
+  <xs:complexType name="DocumentType">
+    <xs:sequence>
+      <xs:element name="SubscriptionOrderConfirmation" type="SubscriptionOrderConfirmationType"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="SubscriptionOrderConfirmationType">
+    <xs:sequence>
+      <xs:element name="MsgId" type="xs:string"/>
+      <xs:element name="CreDtTm" type="xs:dateTime"/>
+      <xs:element name="RltdRef" type="RltdRefType"/>
+      <xs:element name="ConfDtls" type="ConfDtlsType"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="RltdRefType">
+    <xs:sequence>
+      <xs:element name="SubscriptionRequestId" type="xs:string"/>
+      <xs:element name="SettlementId" type="xs:string"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="ConfDtlsType">
+    <xs:sequence>
+      <xs:element name="FinInstrmId" type="xs:string"/>
+      <xs:element name="InvestorParty" type="xs:string"/>
+      <xs:element name="UnitsIssued" type="xs:decimal"/>
+    </xs:sequence>
+  </xs:complexType>
+
+</xs:schema>

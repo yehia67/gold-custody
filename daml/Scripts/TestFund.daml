@@ -1,0 +1,299 @@
+module Scripts.TestFund where
+
+import Daml.Script
+import DA.Date (Month(..), date)
+import DA.Time (time, days, seconds)
+import Config
+import Operators
+import Oracle
+import Token
+import Fund
+import Splice.Api.Token.HoldingV1 (InstrumentId(..))
+import Scripts.Setup
+  ( allocateParties, bootstrapSystem, appoint, registerAndAssay, mintGold
+  , Bootstrap(..)
+  )
+
+-- | Common fixture: a FundShareClass + NavPublishAuthority + one published
+-- NavPoint, all visible to fundManager/cashIssuer so settlement choices (which
+-- co-authorize with them) can fetch everything they need.
+data FundFixture = FundFixture with
+    shareClassCid : ContractId FundShareClass
+    navAuthCid : ContractId NavPublishAuthority
+    navAgentRole : ContractId OperatorRole
+    navCid : ContractId NavPoint
+  deriving (Eq)
+
+setupFundFixture : Bootstrap -> Int -> Decimal -> Script FundFixture
+setupFundFixture b feeBps navPerUnit = do
+  let p = b.parties
+  shareClassCid <- submit p.fundManager do
+    createCmd FundShareClass with
+      fundManager = p.fundManager
+      registrar = p.registrar
+      shareClass = "XAU-A"
+      referenceCurrency = "USD"
+      feeBps
+      gatesPolicy = GatesPolicy with maxRedemptionPerPeriod = 1000000.0, periodLength = days 30
+      configCid = b.configCid
+      instrumentId = InstrumentId with admin = p.fundManager, id = "XAU-A-UNIT"
+  navAuthCid <- submit p.custodian do
+    createCmd NavPublishAuthority with custodian = p.custodian, configCid = b.configCid
+  navAgentRole <- appoint b p.navAgent NavAgent "Global" (days 30)
+  navCid <- submitMulti [p.custodian, p.navAgent] [] do
+    exerciseCmd navAuthCid PublishNavPoint with
+      roleCid = navAgentRole
+      operator = p.navAgent
+      shareClass = "XAU-A"
+      navPerUnit
+      xauReference = 1.0
+      calcMethodHash = "method-hash"
+      observers = [p.custodian, p.fundManager]
+  pure FundFixture with shareClassCid, navAuthCid, navAgentRole, navCid
+
+republishNav : Bootstrap -> FundFixture -> Decimal -> Script (ContractId NavPoint)
+republishNav b fx navPerUnit = do
+  let p = b.parties
+  submitMulti [p.custodian, p.navAgent] [] do
+    exerciseCmd fx.navAuthCid PublishNavPoint with
+      roleCid = fx.navAgentRole
+      operator = p.navAgent
+      shareClass = "XAU-A"
+      navPerUnit
+      xauReference = 1.0
+      calcMethodHash = "method-hash"
+      observers = [p.custodian, p.fundManager]
+
+subscribe : Bootstrap -> FundFixture -> Decimal -> Script (ContractId FundUnitHolding, Optional (ContractId CashHolding))
+subscribe b fx amount = do
+  let p = b.parties
+  cashCid <- submit p.cashIssuer do
+    exerciseCmd b.cashIssuerCid IssueCash with owner = p.investor1, amount, currencyId = "USD"
+  subCid <- submit p.investor1 do
+    createCmd SubscriptionRequest with
+      investor = p.investor1
+      fundManager = p.fundManager
+      cashIssuer = p.cashIssuer
+      shareClassCid = fx.shareClassCid
+      cashCid
+      amount
+      requiredChecks = []
+  submitMulti [p.fundManager, p.cashIssuer] [] do
+    exerciseCmd subCid SettleSubscription with navCid = fx.navCid
+
+testSubscribeRedeemHappy = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  fx <- setupFundFixture b 0 1.0
+  (unitCid, _feeCash) <- subscribe b fx 1000.0
+  Some unit <- queryContractId p.investor1 unitCid
+  assertMsg "subscription minted expected units" (unit.units == 1000.0)
+
+  gatesUsageCid <- submit p.fundManager do
+    createCmd GatesUsage with
+      fundManager = p.fundManager
+      shareClass = "XAU-A"
+      periodStart = time (date 2026 Jan 1) 0 0 0
+      redeemedInPeriod = 0.0
+      policy = GatesPolicy with maxRedemptionPerPeriod = 1000000.0, periodLength = days 30
+  redCid <- submit p.investor1 do
+    createCmd RedemptionRequest with
+      investor = p.investor1
+      fundManager = p.fundManager
+      coAuthorizer = p.cashIssuer
+      shareClassCid = fx.shareClassCid
+      unitCid
+      gatesUsageCid
+      requiredChecks = []
+      inKind = False
+      cashIssuerRoleCid = Some b.cashIssuerCid
+      goldSourceCid = None
+      goldLedgerCid = None
+  (_newGates, cashOut, goldOut) <- submitMulti [p.fundManager, p.cashIssuer] [] do
+    exerciseCmd redCid SettleRedemption with navCid = fx.navCid
+  assertMsg "cash-out redemption produces no gold" (goldOut == None)
+  Some cashCid <- pure cashOut
+  Some cash <- queryContractId p.investor1 cashCid
+  assertMsg "redeemed cash matches units*nav with no fee" (cash.owner == p.investor1 && cash.amount == 1000.0)
+
+testStaleNavBlocksRedemption = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  fx <- setupFundFixture b 0 1.0
+  (unitCid, _feeCash) <- subscribe b fx 500.0
+  gatesUsageCid <- submit p.fundManager do
+    createCmd GatesUsage with
+      fundManager = p.fundManager
+      shareClass = "XAU-A"
+      periodStart = time (date 2026 Jan 1) 0 0 0
+      redeemedInPeriod = 0.0
+      policy = GatesPolicy with maxRedemptionPerPeriod = 1000000.0, periodLength = days 30
+  redCid <- submit p.investor1 do
+    createCmd RedemptionRequest with
+      investor = p.investor1
+      fundManager = p.fundManager
+      coAuthorizer = p.cashIssuer
+      shareClassCid = fx.shareClassCid
+      unitCid
+      gatesUsageCid
+      requiredChecks = []
+      inKind = False
+      cashIssuerRoleCid = Some b.cashIssuerCid
+      goldSourceCid = None
+      goldLedgerCid = None
+
+  -- navValidity is 1 hour by default; advance past it before redeeming.
+  passTime (seconds 7200)
+  submitMultiMustFail [p.fundManager, p.cashIssuer] [] do
+    exerciseCmd redCid SettleRedemption with navCid = fx.navCid
+
+  freshNav <- republishNav b fx 1.0
+  (_newGates, cashOut, _goldOut) <- submitMulti [p.fundManager, p.cashIssuer] [] do
+    exerciseCmd redCid SettleRedemption with navCid = freshNav
+  Some cashCid <- pure cashOut
+  Some cash <- queryContractId p.investor1 cashCid
+  assertMsg "redemption succeeds once NAV is fresh" (cash.amount == 500.0)
+
+testGateAcrossPassTime = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  fx <- setupFundFixture b 0 1.0
+  -- Three independent subscriptions of 60 units each — SettleRedemption
+  -- archives unitCid wholesale (no partial-redemption leftover), so each gate
+  -- test needs its own FundUnitHolding.
+  (unitCid1, _) <- subscribe b fx 60.0
+  (unitCid2, _) <- subscribe b fx 60.0
+  (unitCid3, _) <- subscribe b fx 60.0
+
+  gatesUsageCid0 <- submit p.fundManager do
+    createCmd GatesUsage with
+      fundManager = p.fundManager
+      shareClass = "XAU-A"
+      periodStart = time (date 2026 Jan 1) 0 0 0
+      redeemedInPeriod = 0.0
+      policy = GatesPolicy with maxRedemptionPerPeriod = 100.0, periodLength = days 1
+
+  let mkRedemption unitCid gatesUsageCid = submit p.investor1 do
+        createCmd RedemptionRequest with
+          investor = p.investor1
+          fundManager = p.fundManager
+          coAuthorizer = p.cashIssuer
+          shareClassCid = fx.shareClassCid
+          unitCid
+          gatesUsageCid
+          requiredChecks = []
+          inKind = False
+          cashIssuerRoleCid = Some b.cashIssuerCid
+          goldSourceCid = None
+          goldLedgerCid = None
+
+  red1 <- mkRedemption unitCid1 gatesUsageCid0
+  (gatesUsageCid1, _, _) <- submitMulti [p.fundManager, p.cashIssuer] [] do
+    exerciseCmd red1 SettleRedemption with navCid = fx.navCid
+
+  -- Second redemption in the same period would push usage to 120 > 100: blocked.
+  red2 <- mkRedemption unitCid2 gatesUsageCid1
+  submitMultiMustFail [p.fundManager, p.cashIssuer] [] do
+    exerciseCmd red2 SettleRedemption with navCid = fx.navCid
+
+  -- Advancing past the gate's period length resets usage for the next call.
+  passTime (days 1)
+  freshNav <- republishNav b fx 1.0
+  (gatesUsageCid2, _, _) <- submitMulti [p.fundManager, p.cashIssuer] [] do
+    exerciseCmd red2 SettleRedemption with navCid = freshNav
+
+  -- A third redemption immediately after (still the new period) hits the gate again.
+  red3 <- mkRedemption unitCid3 gatesUsageCid2
+  submitMultiMustFail [p.fundManager, p.cashIssuer] [] do
+    exerciseCmd red3 SettleRedemption with navCid = freshNav
+
+testInKindRedemption = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  fx <- setupFundFixture b 0 1.0
+  (unitCid, _) <- subscribe b fx 1500.0
+
+  assayerRole <- appoint b p.assayer Assayer "Zurich-A" (days 30)
+  bs <- registerAndAssay b assayerRole b.registryCid b.indexCid "BAR-FUND-1" 2500.0 0.999
+  (fundGoldCid, _ledger2) <- mintGold b bs b.ledgerCid p.fundManager 2000.0
+
+  gatesUsageCid <- submit p.fundManager do
+    createCmd GatesUsage with
+      fundManager = p.fundManager
+      shareClass = "XAU-A"
+      periodStart = time (date 2026 Jan 1) 0 0 0
+      redeemedInPeriod = 0.0
+      policy = GatesPolicy with maxRedemptionPerPeriod = 1000000.0, periodLength = days 30
+  redCid <- submit p.investor1 do
+    createCmd RedemptionRequest with
+      investor = p.investor1
+      fundManager = p.fundManager
+      coAuthorizer = p.custodian
+      shareClassCid = fx.shareClassCid
+      unitCid
+      gatesUsageCid
+      requiredChecks = []
+      inKind = True
+      cashIssuerRoleCid = None
+      goldSourceCid = Some fundGoldCid
+      goldLedgerCid = Some b.ledgerCid
+  (_newGates, cashOut, goldOut) <- submitMulti [p.fundManager, p.custodian] [] do
+    exerciseCmd redCid SettleRedemption with navCid = fx.navCid
+  assertMsg "in-kind redemption produces no cash" (cashOut == None)
+  Some goldCid <- pure goldOut
+  Some gold <- queryContractId p.investor1 goldCid
+  assertMsg "investor received in-kind gold equal to net" (gold.owner == p.investor1 && gold.amountGrams == 1500.0)
+
+testFeeArithmetic = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  -- 2.5% fee, NAV chosen so both subscribe and redeem land on exact values.
+  fx <- setupFundFixture b 250 97.5
+  (unitCid, feeCashSub) <- subscribe b fx 1000.0
+  Some feeCashCid <- pure feeCashSub
+  Some feeCash <- queryContractId p.fundManager feeCashCid
+  assertMsg "subscription fee is exactly 2.5% of gross" (feeCash.amount == 25.0)
+  Some unit <- queryContractId p.investor1 unitCid
+  assertMsg "units = net / navPerUnit exactly" (unit.units == 10.0)
+
+  gatesUsageCid <- submit p.fundManager do
+    createCmd GatesUsage with
+      fundManager = p.fundManager
+      shareClass = "XAU-A"
+      periodStart = time (date 2026 Jan 1) 0 0 0
+      redeemedInPeriod = 0.0
+      policy = GatesPolicy with maxRedemptionPerPeriod = 1000000.0, periodLength = days 30
+  redCid <- submit p.investor1 do
+    createCmd RedemptionRequest with
+      investor = p.investor1
+      fundManager = p.fundManager
+      coAuthorizer = p.cashIssuer
+      shareClassCid = fx.shareClassCid
+      unitCid
+      gatesUsageCid
+      requiredChecks = []
+      inKind = False
+      cashIssuerRoleCid = Some b.cashIssuerCid
+      goldSourceCid = None
+      goldLedgerCid = None
+  (_newGates, cashOut, _goldOut) <- submitMulti [p.fundManager, p.cashIssuer] [] do
+    exerciseCmd redCid SettleRedemption with navCid = fx.navCid
+  Some cashCid <- pure cashOut
+  Some cash <- queryContractId p.investor1 cashCid
+  -- gross = 10.0 * 97.5 = 975.0; fee = 975.0 * 0.025 = 24.375; net = 950.625.
+  assertMsg "redemption net = gross - fee exactly" (cash.amount == 950.625)
+
+testBankersRound6Boundary = script do
+  -- Exact ties (…5 at the 7th decimal) round to the nearest even 6th decimal;
+  -- non-ties round to the nearest 6th decimal as usual.
+  assertMsg "tie rounds down to even (0 is even)" (bankersRound6 0.0000005 == 0.0)
+  assertMsg "tie rounds up because 1 is odd, 2 is even" (bankersRound6 0.0000015 == 0.000002)
+  assertMsg "tie at a larger even boundary rounds down" (bankersRound6 0.0000025 == 0.000002)
+  assertMsg "tie at a larger odd boundary rounds up" (bankersRound6 0.0000035 == 0.000004)
+  assertMsg "just below a tie rounds down" (bankersRound6 0.0000004 == 0.0)
+  assertMsg "just above a tie rounds up" (bankersRound6 0.0000006 == 0.000001)

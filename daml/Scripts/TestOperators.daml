@@ -1,0 +1,80 @@
+module Scripts.TestOperators where
+
+import Daml.Script
+import DA.Date (Month(..), date)
+import DA.Time (days, seconds, time)
+import Config
+import Attestations
+import Operators
+import Scripts.Setup (allocateParties, bootstrapSystem, appoint)
+
+testAppointAndAttestHappy = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  roleCid <- appoint b p.assayer Assayer "Zurich-A" (days 30)
+  (attCid, _) <- submit p.assayer do
+    exerciseCmd roleCid SubmitAttestation with
+      indexCid = b.indexCid
+      barSerial = "BAR-001"
+      payload = PurityPayload with purity = 0.999
+      evidenceHash = "abc123"
+      deviceId = None
+  Some att <- queryContractId p.assayer attCid
+  assertMsg "Kind purity" (att.kind == Purity)
+
+testExpiredRoleFails = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  roleCid <- appoint b p.assayer Assayer "Zurich-A" (seconds 1)
+  passTime (seconds 2)
+  submitMustFail p.assayer do
+    exerciseCmd roleCid SubmitAttestation with
+      indexCid = b.indexCid
+      barSerial = "BAR-001"
+      payload = PurityPayload with purity = 0.999
+      evidenceHash = "abc123"
+      deviceId = None
+
+testRevokedRoleFails = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  roleCid <- appoint b p.assayer Assayer "Zurich-A" (days 30)
+  submit p.custodian do
+    exerciseCmd roleCid Revoke
+  submitMustFail p.assayer do
+    exerciseCmd roleCid SubmitAttestation with
+      indexCid = b.indexCid
+      barSerial = "BAR-001"
+      payload = PurityPayload with purity = 0.999
+      evidenceHash = "abc123"
+      deviceId = None
+
+testPermissionMismatchFails = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  roleCid <- appoint b p.transporter Transporter "Zurich-A" (days 30)
+  -- Transporter attempting Weight attestation
+  submitMustFail p.transporter do
+    exerciseCmd roleCid SubmitAttestation with
+      indexCid = b.indexCid
+      barSerial = "BAR-001"
+      payload = WeightPayload with weightGrams = 1000.0
+      evidenceHash = "abc123"
+      deviceId = None
+
+testNonOperatorCannotSubmit = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  roleCid <- appoint b p.assayer Assayer "Zurich-A" (days 30)
+  submitMustFail p.investor1 do
+    exerciseCmd roleCid SubmitAttestation with
+      indexCid = b.indexCid
+      barSerial = "BAR-001"
+      payload = PurityPayload with purity = 0.999
+      evidenceHash = "abc123"
+      deviceId = None

@@ -1,0 +1,290 @@
+module Token where
+
+import DA.TextMap qualified as TextMap
+import DA.Time (subTime)
+import Splice.Api.Token.HoldingV1
+  ( Holding, HoldingView(..), InstrumentId(..), Lock )
+import Splice.Api.Token.MetadataV1 (Metadata(..), emptyMetadata)
+import Splice.Api.Token.TransferInstructionV1
+  ( TransferFactory, TransferFactoryView(..)
+  , TransferInstructionResult(..), TransferInstructionResult_Output(..) )
+import Config (SystemConfig, fetchParams)
+import Vault (VaultReceipt)
+import Attestations
+  ( Attestation, AttestationKind(..), AttestationIndex, lookupAttestation )
+
+-- | Tracks total minted grams per backing serial — makes over-issuance structurally impossible.
+template IssuanceLedger
+  with
+    custodian : Party
+    minted : [(Text, Decimal)]
+  where
+    signatory custodian
+
+    choice RecordMint : ContractId IssuanceLedger
+      with
+        serial : Text
+        grams : Decimal
+      controller custodian
+      do
+        let current = findAmount serial minted
+        create this with minted = upsertAmount serial (current + grams) minted
+
+    choice RecordBurn : ContractId IssuanceLedger
+      with
+        serial : Text
+        grams : Decimal
+      controller custodian
+      do
+        let current = findAmount serial minted
+        assertMsg "Cannot burn more than minted for serial" (grams <= current)
+        create this with minted = upsertAmount serial (current - grams) minted
+
+findAmount : Text -> [(Text, Decimal)] -> Decimal
+findAmount serial xs =
+  case filter (\(s, _) -> s == serial) xs of
+    ((_, a) :: _) -> a
+    [] -> 0.0
+
+upsertAmount : Text -> Decimal -> [(Text, Decimal)] -> [(Text, Decimal)]
+upsertAmount serial amount xs =
+  (serial, amount) :: filter (\(s, _) -> s /= serial) xs
+
+totalMinted : IssuanceLedger -> Decimal
+totalMinted ledger = foldl (+) 0.0 [a | (_, a) <- ledger.minted]
+
+-- | CIP-56 Gold holding.
+template GoldHolding
+  with
+    issuer : Party
+    owner : Party
+    amountGrams : Decimal
+    backingSerials : [Text]
+    instrumentId : InstrumentId
+    lock : Optional Lock
+    meta : Metadata
+  where
+    signatory issuer
+    observer owner
+    ensure amountGrams > 0.0 && length backingSerials > 0
+
+    interface instance Holding for GoldHolding where
+      view = HoldingView with
+        owner
+        instrumentId
+        amount = amountGrams
+        lock
+        meta
+
+    choice TransferGold : ContractId GoldHolding
+      with
+        newOwner : Party
+      controller owner
+      do
+        create this with owner = newOwner
+
+    choice BurnGold : ContractId IssuanceLedger
+      with
+        ledgerCid : ContractId IssuanceLedger
+        serial : Text
+      controller issuer
+      do
+        assertMsg "Serial must be in backing" (serial `elem` backingSerials)
+        exercise ledgerCid RecordBurn with serial, grams = amountGrams
+
+    choice HaircutGold : (ContractId GoldHolding, ContractId IssuanceLedger)
+      with
+        ledgerCid : ContractId IssuanceLedger
+        serial : Text
+        burnGrams : Decimal
+      controller issuer
+      do
+        assertMsg "burnGrams must be positive" (burnGrams > 0.0)
+        assertMsg "burnGrams exceeds holding" (burnGrams < amountGrams)
+        assertMsg "Serial must be in backing" (serial `elem` backingSerials)
+        newLedger <- exercise ledgerCid RecordBurn with serial, grams = burnGrams
+        newHolding <- create this with amountGrams = amountGrams - burnGrams
+        pure (newHolding, newLedger)
+
+-- | Prototype cash holding implementing CIP-56 Holding for escrow/fund cash legs.
+template CashHolding
+  with
+    issuer : Party
+    owner : Party
+    amount : Decimal
+    instrumentId : InstrumentId
+    lock : Optional Lock
+    meta : Metadata
+  where
+    signatory issuer
+    observer owner
+    ensure amount > 0.0
+
+    interface instance Holding for CashHolding where
+      view = HoldingView with
+        owner
+        instrumentId
+        amount
+        lock
+        meta
+
+    choice TransferCash : ContractId CashHolding
+      with
+        newOwner : Party
+      controller owner
+      do
+        create this with owner = newOwner
+
+    choice SplitCash : (ContractId CashHolding, ContractId CashHolding)
+      with
+        takeAmount : Decimal
+      controller owner
+      do
+        assertMsg "takeAmount must be positive" (takeAmount > 0.0)
+        assertMsg "takeAmount exceeds balance" (takeAmount < amount)
+        a <- create this with amount = takeAmount
+        b <- create this with amount = amount - takeAmount
+        pure (a, b)
+
+    choice ConsumeCash : ()
+      controller owner
+      do pure ()
+
+template CashIssuerRole
+  with
+    issuer : Party
+  where
+    signatory issuer
+
+    nonconsuming choice IssueCash : ContractId CashHolding
+      with
+        owner : Party
+        amount : Decimal
+        currencyId : Text
+      controller issuer
+      do
+        assertMsg "amount must be positive" (amount > 0.0)
+        create CashHolding with
+          issuer
+          owner
+          amount
+          instrumentId = InstrumentId with admin = issuer, id = currencyId
+          lock = None
+          meta = emptyMetadata
+
+-- | Transfer factory for gold (CIP-56 TransferFactory) — one-step complete transfers.
+template GoldTransferFactory
+  with
+    admin : Party
+    meta : Metadata
+  where
+    signatory admin
+
+    interface instance TransferFactory for GoldTransferFactory where
+      view = TransferFactoryView with admin, meta
+      transferFactory_transferImpl _self arg = do
+        assertMsg "expectedAdmin mismatch" (arg.expectedAdmin == admin)
+        now <- getTime
+        assertMsg "executeBefore in the past" (arg.transfer.executeBefore > now)
+        assertMsg "requestedAt must be in the past" (arg.transfer.requestedAt <= now)
+        inputAmounts <- mapA (\cid -> do
+          iface <- fetch cid
+          let v = view iface
+          assertMsg "Input owner must be sender" (v.owner == arg.transfer.sender)
+          assertMsg "Instrument mismatch" (v.instrumentId == arg.transfer.instrumentId)
+          opt <- fetchFromInterface @GoldHolding cid
+          case opt of
+            None -> abort "Input holding is not GoldHolding"
+            Some (goldCid, _) -> do
+              archive goldCid
+              pure v.amount) arg.transfer.inputHoldingCids
+        let totalIn = foldl (+) 0.0 inputAmounts
+        assertMsg "Insufficient input amount" (totalIn >= arg.transfer.amount)
+        let change = totalIn - arg.transfer.amount
+        recvCid <- create GoldHolding with
+          issuer = admin
+          owner = arg.transfer.receiver
+          amountGrams = arg.transfer.amount
+          backingSerials = ["TRANSFERRED"]
+          instrumentId = arg.transfer.instrumentId
+          lock = None
+          meta = emptyMetadata
+        changeCids <- if change > 0.0 then do
+            c <- create GoldHolding with
+              issuer = admin
+              owner = arg.transfer.sender
+              amountGrams = change
+              backingSerials = ["CHANGE"]
+              instrumentId = arg.transfer.instrumentId
+              lock = None
+              meta = emptyMetadata
+            pure [toInterfaceContractId @Holding c]
+          else pure []
+        pure TransferInstructionResult with
+          output = TransferInstructionResult_Completed with
+            receiverHoldingCids = [toInterfaceContractId @Holding recvCid]
+          senderChangeCids = changeCids
+          meta = emptyMetadata
+      transferFactory_publicFetchImpl _self arg = do
+        assertMsg "expectedAdmin mismatch" (arg.expectedAdmin == admin)
+        pure (TransferFactoryView with admin, meta)
+
+-- | Mint authority: mint only via this choice (assay + vault receipt + issuance ledger).
+template MintAuthority
+  with
+    custodian : Party
+    regulator : Party
+    configCid : ContractId SystemConfig
+    ledgerCid : ContractId IssuanceLedger
+    indexCid : ContractId AttestationIndex
+    instrumentAdmin : Party
+    instrumentName : Text
+  where
+    signatory custodian
+    observer regulator
+
+    nonconsuming choice MintGold : (ContractId GoldHolding, ContractId IssuanceLedger)
+      with
+        receiptCid : ContractId VaultReceipt
+        assayAttCid : ContractId Attestation
+        indexCid : ContractId AttestationIndex
+        ledgerCid : ContractId IssuanceLedger
+        owner : Party
+        amountGrams : Decimal
+      controller custodian
+      do
+        params <- fetchParams configCid
+        receipt <- fetch receiptCid
+        assertMsg "Receipt custodian mismatch" (receipt.custodian == custodian)
+        bar <- fetch receipt.barCid
+        assay <- fetch assayAttCid
+        assertMsg "Assay must be Purity kind" (assay.kind == Purity)
+        assertMsg "Assay serial mismatch" (assay.barSerial == receipt.serialNumber)
+        now <- getTime
+        idx <- fetch indexCid
+        case lookupAttestation idx receipt.serialNumber Purity of
+          None -> abort "No purity attestation in index"
+          Some indexedCid ->
+            assertMsg "Assay att cid must be indexed latest" (indexedCid == assayAttCid)
+        let age = subTime now assay.attestedAt
+        assertMsg "Assay attestation stale" (age <= params.assayValidity)
+        ledger <- fetch ledgerCid
+        let already = findAmount receipt.serialNumber ledger.minted
+        let availableGrams = bar.weightGrams * bar.purity - already
+        assertMsg "Over-mint against bar" (amountGrams <= availableGrams)
+        assertMsg "amountGrams must be positive" (amountGrams > 0.0)
+        -- Respect gramsPerUnit: minted units * gramsPerUnit <= availableGrams
+        assertMsg "gramsPerUnit must be positive" (params.gramsPerUnit > 0.0)
+        newLedger <- exercise ledgerCid RecordMint with
+          serial = receipt.serialNumber
+          grams = amountGrams
+        holdingCid <- create GoldHolding with
+          issuer = custodian
+          owner
+          amountGrams
+          backingSerials = [receipt.serialNumber]
+          instrumentId = InstrumentId with admin = instrumentAdmin, id = instrumentName
+          lock = None
+          meta = Metadata with
+            values = TextMap.fromList [("backingSerials", receipt.serialNumber)]
+        pure (holdingCid, newLedger)

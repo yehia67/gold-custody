@@ -1,0 +1,96 @@
+module Attestations where
+
+import DA.Text qualified as T
+
+-- | Attestation kinds used across the system.
+-- Permission mapping in Operators.permissionFor is a TOTAL function over this enum;
+-- adding a kind without updating permissionFor is a compile error.
+data AttestationKind =
+    Presence
+  | Weight
+  | Purity
+  | Movement
+  | AuditResult
+  | InsuranceStatus
+  deriving (Eq, Show, Ord)
+
+-- | Typed payload variant per kind — not a stringly-typed blob.
+data AttestationPayload =
+    PresencePayload with present : Bool
+  | WeightPayload with weightGrams : Decimal
+  | PurityPayload with purity : Decimal
+  | MovementPayload with fromLocation : Text, toLocation : Text
+  | AuditResultPayload with findingsHash : Text, passed : Bool
+  | InsurancePayload with policyRef : Text, active : Bool
+  deriving (Eq, Show)
+
+kindOf : AttestationPayload -> AttestationKind
+kindOf (PresencePayload _) = Presence
+kindOf (WeightPayload _) = Weight
+kindOf (PurityPayload _) = Purity
+kindOf (MovementPayload _ _) = Movement
+kindOf (AuditResultPayload _ _) = AuditResult
+kindOf (InsurancePayload _ _) = InsuranceStatus
+
+template Attestation
+  with
+    attestor : Party
+    custodian : Party
+    barSerial : Text
+    kind : AttestationKind
+    payload : AttestationPayload
+    evidenceHash : Text
+    deviceId : Optional Text
+    attestedAt : Time
+  where
+    signatory attestor, custodian
+    ensure
+      T.length evidenceHash > 0
+      && kindOf payload == kind
+
+-- | Custodian-maintained index: barSerial -> latest attestation cid per kind.
+-- Justification (no contract keys): Canton multi-domain deployments restrict
+-- contract keys. Freshness checks fetch this index instead of key-based lookup.
+-- Updated atomically when attestations are submitted via OperatorRole.SubmitAttestation.
+template AttestationIndex
+  with
+    custodian : Party
+    -- Flat list of (serial, kind, cid, attestedAt) entries; latest write wins per
+    -- (serial, kind). attestedAt is denormalized here (not just fetched from the
+    -- Attestation contract) so freshness checks (Compliance.checkFresh) can be
+    -- computed from the broadly-observed index alone, without needing to `fetch`
+    -- the individual Attestation contract — whose stakeholders (attestor,
+    -- custodian) are usually disjoint from a check's own authorizing parties
+    -- (compliance provider, subject), which would otherwise fail authorization.
+    entries : [(Text, AttestationKind, ContractId Attestation, Time)]
+    -- | Parties (operators, checks) needing visibility to fetch/exercise this index.
+    observers : [Party]
+  where
+    signatory custodian
+    observer observers
+
+    choice UpsertAttestation : ContractId AttestationIndex
+      with
+        serial : Text
+        kind : AttestationKind
+        attCid : ContractId Attestation
+        attestedAt : Time
+      controller custodian
+      do
+        let filtered = filter (\(s, k, _, _) -> not (s == serial && k == kind)) entries
+        create this with entries = (serial, kind, attCid, attestedAt) :: filtered
+
+-- | Lookup latest attestation cid for a serial+kind, if any.
+lookupAttestation : AttestationIndex -> Text -> AttestationKind -> Optional (ContractId Attestation)
+lookupAttestation idx serial kind =
+  case filter (\(s, k, _, _) -> s == serial && k == kind) idx.entries of
+    ((_, _, cid, _) :: _) -> Some cid
+    [] -> None
+
+-- | Lookup latest attestedAt time for a serial+kind, if any — used by
+-- freshness checks so they don't need to fetch the Attestation itself.
+lookupAttestedAt : AttestationIndex -> Text -> AttestationKind -> Optional Time
+lookupAttestedAt idx serial kind =
+  case filter (\(s, k, _, _) -> s == serial && k == kind) idx.entries of
+    ((_, _, _, t) :: _) -> Some t
+    [] -> None

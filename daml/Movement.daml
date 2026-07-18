@@ -1,0 +1,201 @@
+module Movement where
+
+import Attestations
+import Operators (OperatorRole, OperatorType(..))
+
+data MovementState = Requested | Released | Received | Reconciled
+  deriving (Eq, Show)
+
+-- | Dual-confirmed weight at a location (created after validating two Weight attestations).
+template ConfirmedWeight
+  with
+    custodian : Party
+    barSerial : Text
+    weightGrams : Decimal
+    humanAttCid : ContractId Attestation
+    deviceAttCid : ContractId Attestation
+    location : Text
+    confirmedAt : Time
+  where
+    signatory custodian
+
+template WeightConfirmationAuthority
+  with
+    custodian : Party
+    weighmasterRoleCid : ContractId OperatorRole
+    weighDeviceRoleCid : ContractId OperatorRole
+    configToleranceGrams : Decimal
+  where
+    signatory custodian
+
+    nonconsuming choice ConfirmWeight : ContractId ConfirmedWeight
+      with
+        humanAttCid : ContractId Attestation
+        deviceAttCid : ContractId Attestation
+        location : Text
+      controller custodian
+      do
+        humanRole <- fetch weighmasterRoleCid
+        deviceRole <- fetch weighDeviceRoleCid
+        assertMsg "First role must be Weighmaster" (humanRole.role == Weighmaster)
+        assertMsg "Second role must be WeighDevice" (deviceRole.role == WeighDevice)
+        humanAtt <- fetch humanAttCid
+        deviceAtt <- fetch deviceAttCid
+        assertMsg "Attestors must differ" (humanAtt.attestor /= deviceAtt.attestor)
+        assertMsg "Human attestor must match Weighmaster" (humanAtt.attestor == humanRole.operator)
+        assertMsg "Device attestor must match WeighDevice" (deviceAtt.attestor == deviceRole.operator)
+        assertMsg "Both must be Weight attestations" (humanAtt.kind == Weight && deviceAtt.kind == Weight)
+        assertMsg "Serials must match" (humanAtt.barSerial == deviceAtt.barSerial)
+        let humanW = case humanAtt.payload of
+              WeightPayload w -> w
+              _ -> error "expected WeightPayload"
+        let deviceW = case deviceAtt.payload of
+              WeightPayload w -> w
+              _ -> error "expected WeightPayload"
+        let diff = if humanW >= deviceW then humanW - deviceW else deviceW - humanW
+        assertMsg "Weight mismatch beyond tolerance" (diff <= configToleranceGrams)
+        now <- getTime
+        create ConfirmedWeight with
+          custodian
+          barSerial = humanAtt.barSerial
+          weightGrams = humanW
+          humanAttCid
+          deviceAttCid
+          location
+          confirmedAt = now
+
+template BarMovement
+  with
+    custodian : Party
+    barSerial : Text
+    fromLocation : Text
+    toLocation : Text
+    state : MovementState
+    requester : Party
+    transporterRoleCid : ContractId OperatorRole
+    vaultKeeperRoleCid : ContractId OperatorRole
+  where
+    signatory custodian
+    observer requester
+
+    -- | movementIndexCid must be threaded (choice param, not this.movementIndexCid —
+    -- BarMovement doesn't even hold that field) so MovementCheck sees the new state.
+    choice ReleaseBar : (ContractId BarMovement, ContractId MovementIndex)
+      with
+        movementIndexCid : ContractId MovementIndex
+      controller custodian
+      do
+        assertMsg "Must be Requested" (state == Requested)
+        vk <- fetch vaultKeeperRoleCid
+        assertMsg "Release requires VaultKeeper role type" (vk.role == VaultKeeper)
+        mv <- create this with state = Released
+        newIdx <- exercise movementIndexCid UpsertMovement with serial = barSerial, mvCid = mv, st = Released
+        pure (mv, newIdx)
+
+    choice ReceiveBar : (ContractId BarMovement, ContractId MovementIndex)
+      with
+        actorRoleCid : ContractId OperatorRole
+        movementIndexCid : ContractId MovementIndex
+      controller custodian
+      do
+        assertMsg "Must be Released" (state == Released)
+        role <- fetch actorRoleCid
+        assertMsg "Receive requires Transporter role type" (role.role == Transporter)
+        mv <- create this with state = Received
+        newIdx <- exercise movementIndexCid UpsertMovement with serial = barSerial, mvCid = mv, st = Received
+        pure (mv, newIdx)
+
+    -- | actor must co-authorize since the created Presence Attestation is
+    -- signed by (attestor, custodian) and attestor = role.operator here.
+    choice ReconcileBar : (ContractId BarMovement, ContractId Attestation, ContractId AttestationIndex, ContractId MovementIndex)
+      with
+        actorRoleCid : ContractId OperatorRole
+        actor : Party
+        confirmedWeightCid : ContractId ConfirmedWeight
+        indexCid : ContractId AttestationIndex
+        movementIndexCid : ContractId MovementIndex
+        evidenceHash : Text
+      controller custodian, actor
+      do
+        assertMsg "Must be Received" (state == Received)
+        role <- fetch actorRoleCid
+        assertMsg "actorRoleCid operator mismatch" (role.operator == actor)
+        assertMsg "Reconcile requires VaultKeeper role type" (role.role == VaultKeeper)
+        cw <- fetch confirmedWeightCid
+        assertMsg "ConfirmedWeight serial mismatch" (cw.barSerial == barSerial)
+        assertMsg "ConfirmedWeight location must be destination" (cw.location == toLocation)
+        now <- getTime
+        attCid <- create Attestation with
+          attestor = role.operator
+          custodian
+          barSerial
+          kind = Presence
+          payload = PresencePayload with present = True
+          evidenceHash
+          deviceId = None
+          attestedAt = now
+        newIdx <- exercise indexCid UpsertAttestation with
+          serial = barSerial
+          kind = Presence
+          attCid
+          attestedAt = now
+        mv <- create this with state = Reconciled
+        newMvIdx <- exercise movementIndexCid UpsertMovement with serial = barSerial, mvCid = mv, st = Reconciled
+        pure (mv, attCid, newIdx, newMvIdx)
+
+-- | Index of open (non-Reconciled) movements for MovementCheck.
+template MovementIndex
+  with
+    custodian : Party
+    -- (serial, movementCid, state)
+    entries : [(Text, ContractId BarMovement, MovementState)]
+    observers : [Party]
+  where
+    signatory custodian
+    observer observers
+
+    choice UpsertMovement : ContractId MovementIndex
+      with
+        serial : Text
+        mvCid : ContractId BarMovement
+        st : MovementState
+      controller custodian
+      do
+        let filtered = filter (\(s, _, _) -> s /= serial) entries
+        create this with entries = (serial, mvCid, st) :: filtered
+
+hasOpenMovement : MovementIndex -> [Text] -> Bool
+hasOpenMovement idx serials =
+  any (\(s, _, st) -> s `elem` serials && st /= Reconciled) idx.entries
+
+template MovementFactory
+  with
+    custodian : Party
+    transporterRoleCid : ContractId OperatorRole
+    vaultKeeperRoleCid : ContractId OperatorRole
+    movementIndexCid : ContractId MovementIndex
+  where
+    signatory custodian
+
+    nonconsuming choice RequestMovement : (ContractId BarMovement, ContractId MovementIndex)
+      with
+        barSerial : Text
+        fromLocation : Text
+        toLocation : Text
+        requester : Party
+      controller custodian
+      do
+        mvCid <- create BarMovement with
+          custodian
+          barSerial
+          fromLocation
+          toLocation
+          state = Requested
+          requester
+          transporterRoleCid
+          vaultKeeperRoleCid
+        newIdx <- exercise movementIndexCid UpsertMovement with
+          serial = barSerial
+          mvCid
+          st = Requested
+        pure (mvCid, newIdx)

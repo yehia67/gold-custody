@@ -1,0 +1,183 @@
+module Scripts.TestOracle where
+
+import Daml.Script
+import DA.Date (Month(..), date)
+import DA.Time (time, days, seconds)
+import Config
+import Operators
+import Oracle
+import Compliance
+import Token
+import Fund
+import Splice.Api.Token.HoldingV1 (InstrumentId(..))
+import Scripts.Setup (allocateParties, bootstrapSystem, appoint, Bootstrap(..))
+
+sampleSources : [PriceSource]
+sampleSources = [PriceSource with name = "LBMA", hash = "lbma-hash-1"]
+
+testNormalPricePublish = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  oracleRole <- appoint b p.oracleOp1 OracleOperator "Global" (days 30)
+  oracleAuthCid <- submit p.custodian do
+    createCmd OraclePublishAuthority with
+      custodian = p.custodian
+      configCid = b.configCid
+      priceIndexCid = b.priceIndexCid
+  (pp, idx1) <- submitMulti [p.custodian, p.oracleOp1] [] do
+    exerciseCmd oracleAuthCid PublishPrice with
+      roleCid = oracleRole
+      operator = p.oracleOp1
+      priceIndexCid = b.priceIndexCid
+      value = 2000.0
+      sources = sampleSources
+      observers = [p.custodian]
+  Some price <- queryContractId p.custodian pp
+  assertMsg "price published at expected value" (price.value == 2000.0)
+  Some idx <- queryContractId p.custodian idx1
+  assertMsg "index tracks latest price" (idx.latestCid == Some pp)
+
+testDivergenceProposeAndConfirm = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  oracleRole <- appoint b p.oracleOp1 OracleOperator "Global" (days 30)
+  oracleAuthCid <- submit p.custodian do
+    createCmd OraclePublishAuthority with
+      custodian = p.custodian
+      configCid = b.configCid
+      priceIndexCid = b.priceIndexCid
+  (_pp1, idx1) <- submitMulti [p.custodian, p.oracleOp1] [] do
+    exerciseCmd oracleAuthCid PublishPrice with
+      roleCid = oracleRole
+      operator = p.oracleOp1
+      priceIndexCid = b.priceIndexCid
+      value = 2000.0
+      sources = sampleSources
+      observers = [p.custodian]
+  -- 10% jump (1000 bps) vastly exceeds maxOracleDivergenceBps (50) — normal
+  -- publish must reject it and point callers at the two-step propose/confirm.
+  submitMultiMustFail [p.custodian, p.oracleOp1] [] do
+    exerciseCmd oracleAuthCid PublishPrice with
+      roleCid = oracleRole
+      operator = p.oracleOp1
+      priceIndexCid = idx1
+      value = 2200.0
+      sources = sampleSources
+      observers = [p.custodian]
+  proposalCid <- submitMulti [p.custodian, p.oracleOp1] [] do
+    exerciseCmd oracleAuthCid ProposeDivergentPrice with
+      roleCid = oracleRole
+      operator = p.oracleOp1
+      priceIndexCid = idx1
+      confirmer = p.regulator
+      value = 2200.0
+      sources = sampleSources
+  (pp2, idx2) <- submitMulti [p.regulator, p.custodian] [] do
+    exerciseCmd proposalCid ConfirmDivergentPrice with observers = [p.custodian]
+  Some price2 <- queryContractId p.custodian pp2
+  assertMsg "divergent price confirmed at proposed value" (price2.value == 2200.0)
+  Some idx2Data <- queryContractId p.custodian idx2
+  assertMsg "index updated to divergent price" (idx2Data.latestCid == Some pp2)
+  -- The proposer cannot confirm their own proposal.
+  proposalCid2 <- submitMulti [p.custodian, p.oracleOp1] [] do
+    exerciseCmd oracleAuthCid ProposeDivergentPrice with
+      roleCid = oracleRole
+      operator = p.oracleOp1
+      priceIndexCid = idx2
+      confirmer = p.oracleOp1
+      value = 2400.0
+      sources = sampleSources
+  submitMultiMustFail [p.oracleOp1, p.custodian] [] do
+    exerciseCmd proposalCid2 ConfirmDivergentPrice with observers = [p.custodian]
+
+testNonNavAgentCannotPublish = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  navAuthCid <- submit p.custodian do
+    createCmd NavPublishAuthority with custodian = p.custodian, configCid = b.configCid
+  -- Weighmaster is not a NavAgent — publishing must be rejected.
+  wrongRole <- appoint b p.weighmaster Weighmaster "Zurich-A" (days 30)
+  submitMultiMustFail [p.custodian, p.weighmaster] [] do
+    exerciseCmd navAuthCid PublishNavPoint with
+      roleCid = wrongRole
+      operator = p.weighmaster
+      shareClass = "XAU-A"
+      navPerUnit = 100.0
+      xauReference = 1.0
+      calcMethodHash = "method-hash"
+      observers = [p.custodian]
+  -- The proper NavAgent role succeeds.
+  navAgentRole <- appoint b p.navAgent NavAgent "Global" (days 30)
+  navCid <- submitMulti [p.custodian, p.navAgent] [] do
+    exerciseCmd navAuthCid PublishNavPoint with
+      roleCid = navAgentRole
+      operator = p.navAgent
+      shareClass = "XAU-A"
+      navPerUnit = 100.0
+      xauReference = 1.0
+      calcMethodHash = "method-hash"
+      observers = [p.custodian]
+  Some nav <- queryContractId p.navAgent navCid
+  assertMsg "NavAgent publish succeeds" (nav.shareClass == "XAU-A")
+
+testStaleNavRejectedByFundConsumerHelper = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  navAuthCid <- submit p.custodian do
+    createCmd NavPublishAuthority with custodian = p.custodian, configCid = b.configCid
+  navAgentRole <- appoint b p.navAgent NavAgent "Global" (days 30)
+  navCid <- submitMulti [p.custodian, p.navAgent] [] do
+    exerciseCmd navAuthCid PublishNavPoint with
+      roleCid = navAgentRole
+      operator = p.navAgent
+      shareClass = "XAU-A"
+      navPerUnit = 100.0
+      xauReference = 1.0
+      calcMethodHash = "method-hash"
+      observers = [p.custodian, p.fundManager]
+
+  shareClassCid <- submit p.fundManager do
+    createCmd FundShareClass with
+      fundManager = p.fundManager
+      registrar = p.registrar
+      shareClass = "XAU-A"
+      referenceCurrency = "USD"
+      feeBps = 50
+      gatesPolicy = GatesPolicy with maxRedemptionPerPeriod = 1000000.0, periodLength = days 30
+      configCid = b.configCid
+      instrumentId = InstrumentId with admin = p.fundManager, id = "XAU-A-UNIT"
+  cashCid <- submit p.cashIssuer do
+    exerciseCmd b.cashIssuerCid IssueCash with owner = p.investor1, amount = 1000.0, currencyId = "USD"
+  subCid <- submit p.investor1 do
+    createCmd SubscriptionRequest with
+      investor = p.investor1
+      fundManager = p.fundManager
+      cashIssuer = p.cashIssuer
+      shareClassCid
+      cashCid
+      amount = 1000.0
+      requiredChecks = []
+
+  -- navValidity is 1 hour by default; advancing 2 hours makes the NavPoint stale.
+  passTime (seconds 7200)
+  submitMultiMustFail [p.fundManager, p.cashIssuer] [] do
+    exerciseCmd subCid SettleSubscription with navCid
+
+  -- A freshly published NavPoint (at the new, later ledger time) settles fine.
+  freshNavCid <- submitMulti [p.custodian, p.navAgent] [] do
+    exerciseCmd navAuthCid PublishNavPoint with
+      roleCid = navAgentRole
+      operator = p.navAgent
+      shareClass = "XAU-A"
+      navPerUnit = 100.0
+      xauReference = 1.0
+      calcMethodHash = "method-hash"
+      observers = [p.custodian, p.fundManager]
+  (unitCid, _feeCash) <- submitMulti [p.fundManager, p.cashIssuer] [] do
+    exerciseCmd subCid SettleSubscription with navCid = freshNavCid
+  Some unit <- queryContractId p.investor1 unitCid
+  assertMsg "units issued once NAV is fresh" (unit.owner == p.investor1 && unit.units > 0.0)

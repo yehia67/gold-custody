@@ -1,0 +1,156 @@
+module Scripts.TestEscrow where
+
+import Daml.Script
+import DA.Date (Month(..), date)
+import DA.Time (RelTime, time, days, seconds)
+import DA.Optional (isSome)
+import Config
+import Compliance
+import Operators
+import Escrow
+import Token
+import Scripts.Setup
+  ( allocateParties, bootstrapSystem, appoint, registerAndAssay, mintGold
+  , Bootstrap(..)
+  )
+
+-- | Common fixture: custodian mints gold to itself (so seller == issuer, the
+-- assumption Escrow's authorization relies on — see Escrow.daml), issues cash
+-- to investor1, and wires up KYC + Limit checks visible to investor1.
+data EscrowFixture = EscrowFixture with
+    goldCid : ContractId GoldHolding
+    cashCid : ContractId CashHolding
+    checks : [ContractId ComplianceCheck]
+  deriving (Eq)
+
+setupEscrowFixture : Bootstrap -> Text -> Decimal -> Decimal -> Script EscrowFixture
+setupEscrowFixture b serial goldGrams cashAmount = do
+  let p = b.parties
+  assayerRole <- appoint b p.assayer Assayer "Zurich-A" (days 30)
+  bs <- registerAndAssay b assayerRole b.registryCid b.indexCid serial 1000.0 0.999
+  (goldCid, _newLedger) <- mintGold b bs b.ledgerCid p.custodian goldGrams
+  cashCid <- submit p.cashIssuer do
+    exerciseCmd b.cashIssuerCid IssueCash with
+      owner = p.investor1
+      amount = cashAmount
+      currencyId = "USD"
+  kycCid <- submit p.complianceProvider do
+    createCmd KYCCheck with
+      provider = p.complianceProvider
+      subject = p.investor1
+      validUntil = time (date 2026 Dec 1) 0 0 0
+  limCid <- submit p.complianceProvider do
+    createCmd LimitCheck with
+      provider = p.complianceProvider
+      maxTransfer = 1000000.0
+      observers = [p.investor1]
+  let checks = [toInterfaceContractId @ComplianceCheck kycCid, toInterfaceContractId @ComplianceCheck limCid]
+  pure EscrowFixture with goldCid, cashCid, checks
+
+proposeEscrow : Bootstrap -> EscrowFixture -> Decimal -> Optional RelTime -> Script (ContractId EscrowProposal)
+proposeEscrow b fx cashAmount expiryOverride =
+  submit b.parties.custodian do
+    createCmd EscrowProposal with
+      seller = b.parties.custodian
+      buyer = b.parties.investor1
+      goldCid = fx.goldCid
+      cashAmount
+      cashIssuer = b.parties.cashIssuer
+      requiredChecks = fx.checks
+      configCid = b.configCid
+      expiryOverride
+
+testHappySettle = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  fx <- setupEscrowFixture b "BAR-ESC-1" 100.0 500.0
+  prop <- proposeEscrow b fx 500.0 None
+  esc <- submitMulti [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd prop AcceptAndFund with cashHoldingCid = fx.cashCid
+  (goldOut, cashOut) <- submitMulti [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd esc Settle
+  Some gold <- queryContractId p.investor1 goldOut
+  Some cash <- queryContractId p.custodian cashOut
+  assertMsg "buyer received gold" (gold.owner == p.investor1 && gold.amountGrams == 100.0)
+  assertMsg "seller received cash" (cash.owner == p.custodian && cash.amount == 500.0)
+
+testCheckFailureBlocksSettle = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  fx0 <- setupEscrowFixture b "BAR-ESC-2" 50.0 100.0
+  -- Replace the check list with a LimitCheck that the cash amount exceeds.
+  strictLimCid <- submit p.complianceProvider do
+    createCmd LimitCheck with
+      provider = p.complianceProvider
+      maxTransfer = 10.0
+      observers = [p.investor1]
+  let fx = fx0 with checks = [toInterfaceContractId @ComplianceCheck strictLimCid]
+  prop <- proposeEscrow b fx 100.0 None
+  esc <- submitMulti [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd prop AcceptAndFund with cashHoldingCid = fx.cashCid
+  submitMultiMustFail [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd esc Settle
+
+testFailedSettleLeavesHoldingsUnchanged = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  fx0 <- setupEscrowFixture b "BAR-ESC-3" 60.0 200.0
+  strictLimCid <- submit p.complianceProvider do
+    createCmd LimitCheck with
+      provider = p.complianceProvider
+      maxTransfer = 10.0
+      observers = [p.investor1]
+  let fx = fx0 with checks = [toInterfaceContractId @ComplianceCheck strictLimCid]
+  prop <- proposeEscrow b fx 200.0 None
+  esc <- submitMulti [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd prop AcceptAndFund with cashHoldingCid = fx.cashCid
+  submitMultiMustFail [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd esc Settle
+  -- The escrow itself is untouched by the failed Settle attempt: it is still
+  -- there, still holding the locked gold/cash cids, and can still be fetched.
+  Some escrow <- queryContractId p.custodian esc
+  assertMsg "escrow still open" (escrow.cashAmount == 200.0)
+  goldStill <- queryContractId p.custodian escrow.goldCid
+  cashStill <- queryContractId p.investor1 escrow.cashCid
+  assertMsg "locked gold still active" (isSome goldStill)
+  assertMsg "locked cash still active" (isSome cashStill)
+
+testExpiryCancel = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  fx <- setupEscrowFixture b "BAR-ESC-4" 70.0 300.0
+  prop <- proposeEscrow b fx 300.0 (Some (seconds 3600))
+  esc <- submitMulti [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd prop AcceptAndFund with cashHoldingCid = fx.cashCid
+  -- Cancel before expiry must fail.
+  submitMultiMustFail [p.custodian, p.cashIssuer] [p.investor1] do
+    exerciseCmd esc Cancel
+  passTime (seconds 3601)
+  (goldBack, cashBack) <- submitMulti [p.custodian, p.cashIssuer] [p.investor1] do
+    exerciseCmd esc Cancel
+  Some gold <- queryContractId p.custodian goldBack
+  Some cash <- queryContractId p.investor1 cashBack
+  assertMsg "gold returned to seller" (gold.owner == p.custodian && gold.amountGrams == 70.0)
+  assertMsg "cash returned to buyer" (cash.owner == p.investor1 && cash.amount == 300.0)
+  -- And Settle is no longer possible after cancellation consumed the escrow.
+  submitMultiMustFail [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd esc Settle
+
+testUnauthorizedSettleFails = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  fx <- setupEscrowFixture b "BAR-ESC-5" 80.0 400.0
+  prop <- proposeEscrow b fx 400.0 None
+  esc <- submitMulti [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd prop AcceptAndFund with cashHoldingCid = fx.cashCid
+  -- Seller (not buyer) attempting to Settle must fail — buyer is the controller.
+  submitMultiMustFail [p.custodian, p.cashIssuer] [p.investor1] do
+    exerciseCmd esc Settle
+  -- An unrelated third party cannot settle either.
+  submitMustFail p.investor2 do
+    exerciseCmd esc Settle

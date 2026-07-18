@@ -1,0 +1,193 @@
+module Scripts.Setup where
+
+import Daml.Script
+import DA.Time (RelTime, days, seconds)
+import Config
+import Vault
+import Attestations
+import Operators
+import Token
+import Movement
+import Discrepancy
+import Oracle
+import Splice.Api.Token.HoldingV1 (InstrumentId(..))
+
+data Parties = Parties with
+    systemOperator : Party
+    custodian : Party
+    regulator : Party
+    fundManager : Party
+    registrar : Party
+    investor1 : Party
+    investor2 : Party
+    oracleOp1 : Party
+    oracleOp2 : Party
+    navAgent : Party
+    weighmaster : Party
+    weighDevice : Party
+    assayer : Party
+    transporter : Party
+    auditor : Party
+    complianceProvider : Party
+    vaultKeeper : Party
+    cashIssuer : Party
+  deriving (Eq, Show)
+
+data Bootstrap = Bootstrap with
+    parties : Parties
+    configCid : ContractId SystemConfig
+    registryCid : ContractId SerialRegistry
+    indexCid : ContractId AttestationIndex
+    custodianRoleCid : ContractId CustodianRole
+    ledgerCid : ContractId IssuanceLedger
+    mintAuthCid : ContractId MintAuthority
+    movementIndexCid : ContractId MovementIndex
+    discrepancyIndexCid : ContractId DiscrepancyIndex
+    priceIndexCid : ContractId PriceIndex
+    cashIssuerCid : ContractId CashIssuerRole
+  deriving (Eq)
+
+allocateParties : Script Parties
+allocateParties = do
+  systemOperator <- allocateParty "SystemOperator"
+  custodian <- allocateParty "Custodian"
+  regulator <- allocateParty "Regulator"
+  fundManager <- allocateParty "FundManager"
+  registrar <- allocateParty "Registrar"
+  investor1 <- allocateParty "Investor1"
+  investor2 <- allocateParty "Investor2"
+  oracleOp1 <- allocateParty "OracleOp1"
+  oracleOp2 <- allocateParty "OracleOp2"
+  navAgent <- allocateParty "NavAgent"
+  weighmaster <- allocateParty "Weighmaster"
+  weighDevice <- allocateParty "WeighDevice"
+  assayer <- allocateParty "Assayer"
+  transporter <- allocateParty "Transporter"
+  auditor <- allocateParty "Auditor"
+  complianceProvider <- allocateParty "ComplianceProvider"
+  vaultKeeper <- allocateParty "VaultKeeper"
+  cashIssuer <- allocateParty "CashIssuer"
+  pure Parties with ..
+
+-- | Every allocated party except the given one — used to populate observer lists
+-- on custodian/system-operator-signed indexes so downstream operators, buyers,
+-- investors etc. (each acting via their own submit) can fetch/exercise them.
+-- Canton multi-domain restriction: contract keys MUST NOT be used, so broad
+-- observer lists (rather than key-based lookup) are how these shared indexes
+-- stay visible to every party that legitimately needs to read them.
+allOtherParties : Parties -> Party -> [Party]
+allOtherParties p exclude = filter (/= exclude)
+  [ p.systemOperator, p.custodian, p.regulator, p.fundManager, p.registrar
+  , p.investor1, p.investor2, p.oracleOp1, p.oracleOp2, p.navAgent
+  , p.weighmaster, p.weighDevice, p.assayer, p.transporter, p.auditor
+  , p.complianceProvider, p.vaultKeeper, p.cashIssuer
+  ]
+
+-- | Full system bootstrap used by E2E and component tests.
+bootstrapSystem : Parties -> SystemParams -> Script Bootstrap
+bootstrapSystem p params = do
+  configCid <- submit p.systemOperator do
+    createCmd SystemConfig with
+      operator = p.systemOperator
+      params
+      observers = allOtherParties p p.systemOperator
+  registryCid <- submit p.custodian do
+    createCmd SerialRegistry with custodian = p.custodian, registeredSerials = []
+  indexCid <- submit p.custodian do
+    createCmd AttestationIndex with
+      custodian = p.custodian
+      entries = []
+      observers = allOtherParties p p.custodian
+  custodianRoleCid <- submit p.custodian do
+    createCmd CustodianRole with
+      custodian = p.custodian
+      regulator = p.regulator
+      configCid
+      registryCid
+      indexCid
+  ledgerCid <- submit p.custodian do
+    createCmd IssuanceLedger with custodian = p.custodian, minted = []
+  mintAuthCid <- submit p.custodian do
+    createCmd MintAuthority with
+      custodian = p.custodian
+      regulator = p.regulator
+      configCid
+      ledgerCid
+      indexCid
+      instrumentAdmin = p.custodian
+      instrumentName = "XAU-BAR"
+  movementIndexCid <- submit p.custodian do
+    createCmd MovementIndex with
+      custodian = p.custodian
+      entries = []
+      observers = allOtherParties p p.custodian
+  discrepancyIndexCid <- submit p.custodian do
+    createCmd DiscrepancyIndex with
+      custodian = p.custodian
+      entries = []
+      observers = allOtherParties p p.custodian
+  priceIndexCid <- submit p.custodian do
+    createCmd PriceIndex with custodian = p.custodian, latestCid = None
+  cashIssuerCid <- submit p.cashIssuer do
+    createCmd CashIssuerRole with issuer = p.cashIssuer
+  pure Bootstrap with parties = p, ..
+
+appoint : Bootstrap -> Party -> OperatorType -> Text -> RelTime -> Script (ContractId OperatorRole)
+appoint b operator role site validFor =
+  submit b.parties.custodian do
+    exerciseCmd b.custodianRoleCid AppointOperator with
+      operator
+      role
+      site
+      permissions = defaultPermissions role
+      validFor
+
+-- | Bundle of cids produced by registering a bar and submitting a fresh purity
+-- assay for it — threading registry/index cids so callers can register several
+-- bars in one test without hitting a stale-cid failure.
+data BarSetup = BarSetup with
+    receiptCid : ContractId VaultReceipt
+    assayAttCid : ContractId Attestation
+    registryCid : ContractId SerialRegistry
+    indexCid : ContractId AttestationIndex
+  deriving (Eq)
+
+registerAndAssay
+  :  Bootstrap
+  -> ContractId OperatorRole -- ^ Assayer's OperatorRole
+  -> ContractId SerialRegistry
+  -> ContractId AttestationIndex
+  -> Text -> Decimal -> Decimal
+  -> Script BarSetup
+registerAndAssay b assayerRoleCid registryCid indexCid serial weightGrams purity = do
+  (_, newReg, receiptCid) <- submit b.parties.custodian do
+    exerciseCmd b.custodianRoleCid RegisterBar with
+      registryCid
+      serialNumber = serial
+      weightGrams
+      purity
+      vaultLocation = "Zurich-A"
+      custodianRef = "REF-" <> serial
+  (assayAttCid, newIdx) <- submit b.parties.assayer do
+    exerciseCmd assayerRoleCid SubmitAttestation with
+      indexCid
+      barSerial = serial
+      payload = PurityPayload with purity
+      evidenceHash = "assay-" <> serial
+      deviceId = None
+  pure BarSetup with receiptCid, assayAttCid, registryCid = newReg, indexCid = newIdx
+
+-- | Mint via a BarSetup, threading indexCid/ledgerCid explicitly (both are
+-- choice parameters on MintGold, not read from MintAuthority's own fields).
+mintGold
+  :  Bootstrap -> BarSetup -> ContractId IssuanceLedger -> Party -> Decimal
+  -> Script (ContractId GoldHolding, ContractId IssuanceLedger)
+mintGold b bs ledgerCid owner amountGrams =
+  submit b.parties.custodian do
+    exerciseCmd b.mintAuthCid MintGold with
+      receiptCid = bs.receiptCid
+      assayAttCid = bs.assayAttCid
+      indexCid = bs.indexCid
+      ledgerCid
+      owner
+      amountGrams

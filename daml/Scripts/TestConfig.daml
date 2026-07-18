@@ -1,0 +1,56 @@
+module Scripts.TestConfig where
+
+import Daml.Script
+import DA.Date (Month(..), date)
+import DA.Time (seconds, time)
+import Config
+import Scripts.Setup (allocateParties)
+
+-- | Consumer that observes SystemConfig params.
+template ConfigConsumer
+  with
+    operator : Party
+    observer : Party
+    lastSeenMinPurity : Decimal
+  where
+    signatory operator
+    observer observer
+
+    choice ObserveConfig : ContractId ConfigConsumer
+      with
+        configCid : ContractId SystemConfig
+      controller observer
+      do
+        cfg <- fetch configCid
+        create this with lastSeenMinPurity = cfg.params.minPurity
+
+testConfigUpdateAndObserve = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  cfgCid <- submit p.systemOperator do
+    createCmd SystemConfig with operator = p.systemOperator, params = defaultSystemParams, observers = [p.custodian]
+  consumerCid <- submit p.systemOperator do
+    createCmd ConfigConsumer with
+      operator = p.systemOperator
+      observer = p.custodian
+      lastSeenMinPurity = 0.0
+  observed1 <- submit p.custodian do
+    exerciseCmd consumerCid ObserveConfig with configCid = cfgCid
+  Some c1 <- queryContractId p.custodian observed1
+  assertMsg "Initial purity observed" (c1.lastSeenMinPurity == 0.995)
+
+  let newParams = defaultSystemParams with minPurity = 0.999
+  newCfgCid <- submit p.systemOperator do
+    exerciseCmd cfgCid UpdateConfig with newParams
+  observed2 <- submit p.custodian do
+    exerciseCmd observed1 ObserveConfig with configCid = newCfgCid
+  Some c2 <- queryContractId p.custodian observed2
+  assertMsg "Updated purity observed" (c2.lastSeenMinPurity == 0.999)
+
+testConfigUnauthorizedUpdateFails = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  cfgCid <- submit p.systemOperator do
+    createCmd SystemConfig with operator = p.systemOperator, params = defaultSystemParams, observers = []
+  submitMustFail p.custodian do
+    exerciseCmd cfgCid UpdateConfig with newParams = defaultSystemParams with minPurity = 0.99

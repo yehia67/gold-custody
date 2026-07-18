@@ -1,0 +1,469 @@
+module Scripts.TestEndToEnd where
+
+import Daml.Script
+import DA.Date (Month(..), date)
+import DA.Time (time, days, seconds)
+import DA.Optional (isNone)
+import Config
+import Attestations
+import Operators
+import Movement
+import Discrepancy
+import Oracle
+import Compliance
+import Escrow
+import Token
+import Fund
+import Splice.Api.Token.HoldingV1 (InstrumentId(..))
+import Scripts.Setup
+  ( allocateParties, bootstrapSystem, appoint, registerAndAssay, mintGold
+  , Bootstrap(..)
+  )
+
+-- | Full lifecycle: register/assay a bar, mint gold, publish an oracle price,
+-- stand up a fund share class, publish NAV, subscribe cash into units, then
+-- redeem those units back out to cash.
+genesisToRedemption = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+
+  assayerRole <- appoint b p.assayer Assayer "Zurich-A" (days 30)
+  bs <- registerAndAssay b assayerRole b.registryCid b.indexCid "BAR-E2E-1" 1000.0 0.999
+  (_goldCid, _ledger1) <- mintGold b bs b.ledgerCid p.custodian 500.0
+
+  oracleRole <- appoint b p.oracleOp1 OracleOperator "Global" (days 30)
+  oracleAuthCid <- submit p.custodian do
+    createCmd OraclePublishAuthority with
+      custodian = p.custodian
+      configCid = b.configCid
+      priceIndexCid = b.priceIndexCid
+  (priceCid, _priceIdx) <- submitMulti [p.custodian, p.oracleOp1] [] do
+    exerciseCmd oracleAuthCid PublishPrice with
+      roleCid = oracleRole
+      operator = p.oracleOp1
+      priceIndexCid = b.priceIndexCid
+      value = 2000.0
+      sources = [PriceSource with name = "LBMA", hash = "genesis-price"]
+      observers = [p.custodian]
+  Some price <- queryContractId p.custodian priceCid
+  assertMsg "genesis XAU price published" (price.value == 2000.0)
+
+  shareClassCid <- submit p.fundManager do
+    createCmd FundShareClass with
+      fundManager = p.fundManager
+      registrar = p.registrar
+      shareClass = "XAU-A"
+      referenceCurrency = "USD"
+      feeBps = 25
+      gatesPolicy = GatesPolicy with maxRedemptionPerPeriod = 1000000.0, periodLength = days 30
+      configCid = b.configCid
+      instrumentId = InstrumentId with admin = p.fundManager, id = "XAU-A-UNIT"
+  navAuthCid <- submit p.custodian do
+    createCmd NavPublishAuthority with custodian = p.custodian, configCid = b.configCid
+  navAgentRole <- appoint b p.navAgent NavAgent "Global" (days 30)
+  navCid <- submitMulti [p.custodian, p.navAgent] [] do
+    exerciseCmd navAuthCid PublishNavPoint with
+      roleCid = navAgentRole
+      operator = p.navAgent
+      shareClass = "XAU-A"
+      navPerUnit = 100.0
+      xauReference = 1.0
+      calcMethodHash = "genesis-nav-method"
+      observers = [p.custodian, p.fundManager]
+
+  cashCid <- submit p.cashIssuer do
+    exerciseCmd b.cashIssuerCid IssueCash with owner = p.investor1, amount = 10000.0, currencyId = "USD"
+  subCid <- submit p.investor1 do
+    createCmd SubscriptionRequest with
+      investor = p.investor1
+      fundManager = p.fundManager
+      cashIssuer = p.cashIssuer
+      shareClassCid
+      cashCid
+      amount = 10000.0
+      requiredChecks = []
+  (unitCid, _feeCashOpt) <- submitMulti [p.fundManager, p.cashIssuer] [] do
+    exerciseCmd subCid SettleSubscription with navCid
+  Some unit <- queryContractId p.investor1 unitCid
+  assertMsg "investor holds units after subscription" (unit.owner == p.investor1 && unit.units > 0.0)
+
+  gatesUsageCid <- submit p.fundManager do
+    createCmd GatesUsage with
+      fundManager = p.fundManager
+      shareClass = "XAU-A"
+      periodStart = time (date 2026 Jan 1) 0 0 0
+      redeemedInPeriod = 0.0
+      policy = GatesPolicy with maxRedemptionPerPeriod = 1000000.0, periodLength = days 30
+  redCid <- submit p.investor1 do
+    createCmd RedemptionRequest with
+      investor = p.investor1
+      fundManager = p.fundManager
+      coAuthorizer = p.cashIssuer
+      shareClassCid
+      unitCid
+      gatesUsageCid
+      requiredChecks = []
+      inKind = False
+      cashIssuerRoleCid = Some b.cashIssuerCid
+      goldSourceCid = None
+      goldLedgerCid = None
+  (_newGates, cashOut, _goldOut) <- submitMulti [p.fundManager, p.cashIssuer] [] do
+    exerciseCmd redCid SettleRedemption with navCid
+  Some cashOutCid <- pure cashOut
+  Some finalCash <- queryContractId p.investor1 cashOutCid
+  assertMsg "genesis-to-redemption round trip nets positive cash back" (finalCash.owner == p.investor1 && finalCash.amount > 0.0)
+
+-- | Gold minted against a fresh assay becomes untradeable once that assay ages
+-- past assayValidity — the custodian effectively "freezes" its own holding
+-- until a fresh attestation is submitted, at which point trading resumes.
+selfFreezingToken = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  assayerRole <- appoint b p.assayer Assayer "Zurich-A" (days 3650)
+  bs <- registerAndAssay b assayerRole b.registryCid b.indexCid "BAR-FREEZE-1" 1000.0 0.999
+  (goldCid, _ledger1) <- mintGold b bs b.ledgerCid p.custodian 100.0
+
+  kycCid <- submit p.complianceProvider do
+    createCmd KYCCheck with
+      provider = p.complianceProvider
+      subject = p.investor1
+      validUntil = time (date 2030 Jan 1) 0 0 0
+  assayFreshCid <- submit p.complianceProvider do
+    createCmd AssayFreshnessCheck with
+      provider = p.complianceProvider
+      custodian = p.custodian
+      configCid = b.configCid
+      indexCid = bs.indexCid
+      backingSerials = ["BAR-FREEZE-1"]
+  let checksStale = [toInterfaceContractId @ComplianceCheck kycCid, toInterfaceContractId @ComplianceCheck assayFreshCid]
+
+  cashCid <- submit p.cashIssuer do
+    exerciseCmd b.cashIssuerCid IssueCash with owner = p.investor1, amount = 500.0, currencyId = "USD"
+  prop <- submit p.custodian do
+    createCmd EscrowProposal with
+      seller = p.custodian
+      buyer = p.investor1
+      goldCid
+      cashAmount = 500.0
+      cashIssuer = p.cashIssuer
+      requiredChecks = checksStale
+      configCid = b.configCid
+      expiryOverride = Some (days 3650)
+  esc <- submitMulti [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd prop AcceptAndFund with cashHoldingCid = cashCid
+
+  -- Let the purity assay age past assayValidity (30 days default).
+  passTime (days 31)
+  submitMultiMustFail [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd esc Settle
+
+  -- A fresh assay "unfreezes" the token: resubmit purity, then re-check with a
+  -- fresh AssayFreshnessCheck pointed at the updated index.
+  (_freshAssayCid, freshIdx) <- submit p.assayer do
+    exerciseCmd assayerRole SubmitAttestation with
+      indexCid = bs.indexCid
+      barSerial = "BAR-FREEZE-1"
+      payload = PurityPayload with purity = 0.999
+      evidenceHash = "reassay-BAR-FREEZE-1"
+      deviceId = None
+  assayFreshCid2 <- submit p.complianceProvider do
+    createCmd AssayFreshnessCheck with
+      provider = p.complianceProvider
+      custodian = p.custodian
+      configCid = b.configCid
+      indexCid = freshIdx
+      backingSerials = ["BAR-FREEZE-1"]
+  esc2 <- submitMulti [p.custodian, p.investor1] [] do
+    exerciseCmd esc ReconfigureChecks with
+      newChecks = [toInterfaceContractId @ComplianceCheck kycCid, toInterfaceContractId @ComplianceCheck assayFreshCid2]
+  (goldOut, _cashOut) <- submitMulti [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd esc2 Settle
+  Some gold <- queryContractId p.investor1 goldOut
+  assertMsg "token unfreezes once assay is fresh again" (gold.owner == p.investor1)
+
+-- | A bar in transit (open BarMovement) locks its holding out of trading via
+-- MovementCheck; only once ReconcileBar closes the movement can it settle.
+transitLockdown = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  assayerRole <- appoint b p.assayer Assayer "Zurich-A" (days 30)
+  bs <- registerAndAssay b assayerRole b.registryCid b.indexCid "BAR-TRANSIT-1" 1000.0 0.999
+  (goldCid, _ledger1) <- mintGold b bs b.ledgerCid p.custodian 90.0
+
+  transporterRole <- appoint b p.transporter Transporter "Zurich-A" (days 30)
+  vaultKeeperRole <- appoint b p.vaultKeeper VaultKeeper "Zurich-A" (days 30)
+  factoryCid <- submit p.custodian do
+    createCmd MovementFactory with
+      custodian = p.custodian
+      transporterRoleCid = transporterRole
+      vaultKeeperRoleCid = vaultKeeperRole
+      movementIndexCid = b.movementIndexCid
+  (mv, idxRequested) <- submit p.custodian do
+    exerciseCmd factoryCid RequestMovement with
+      barSerial = "BAR-TRANSIT-1"
+      fromLocation = "Zurich-A"
+      toLocation = "Zurich-B"
+      requester = p.custodian
+
+  kycCid <- submit p.complianceProvider do
+    createCmd KYCCheck with
+      provider = p.complianceProvider
+      subject = p.investor1
+      validUntil = time (date 2030 Jan 1) 0 0 0
+  movementCheckOpen <- submit p.complianceProvider do
+    createCmd MovementCheck with
+      provider = p.complianceProvider
+      custodian = p.custodian
+      movementIndexCid = idxRequested
+      backingSerials = ["BAR-TRANSIT-1"]
+  cashCid <- submit p.cashIssuer do
+    exerciseCmd b.cashIssuerCid IssueCash with owner = p.investor1, amount = 400.0, currencyId = "USD"
+  prop <- submit p.custodian do
+    createCmd EscrowProposal with
+      seller = p.custodian
+      buyer = p.investor1
+      goldCid
+      cashAmount = 400.0
+      cashIssuer = p.cashIssuer
+      requiredChecks =
+        [ toInterfaceContractId @ComplianceCheck kycCid
+        , toInterfaceContractId @ComplianceCheck movementCheckOpen
+        ]
+      configCid = b.configCid
+      expiryOverride = None
+  esc <- submitMulti [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd prop AcceptAndFund with cashHoldingCid = cashCid
+  submitMultiMustFail [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd esc Settle
+
+  -- Drive the movement to Reconciled.
+  (mvReleased, idxReleased) <- submit p.custodian do
+    exerciseCmd mv ReleaseBar with movementIndexCid = idxRequested
+  (mvReceived, idxReceived) <- submit p.custodian do
+    exerciseCmd mvReleased ReceiveBar with actorRoleCid = transporterRole, movementIndexCid = idxReleased
+  weighmasterRole <- appoint b p.weighmaster Weighmaster "Zurich-B" (days 30)
+  weighDeviceRole <- appoint b p.weighDevice WeighDevice "Zurich-B" (days 30)
+  (hAtt, idxAtt1) <- submit p.weighmaster do
+    exerciseCmd weighmasterRole SubmitAttestation with
+      indexCid = bs.indexCid
+      barSerial = "BAR-TRANSIT-1"
+      payload = WeightPayload 999.0
+      evidenceHash = "wm-dest"
+      deviceId = None
+  (dAtt, idxAtt2) <- submit p.weighDevice do
+    exerciseCmd weighDeviceRole SubmitAttestation with
+      indexCid = idxAtt1
+      barSerial = "BAR-TRANSIT-1"
+      payload = WeightPayload 999.0
+      evidenceHash = "wd-dest"
+      deviceId = Some "SCALE-DEST"
+  weightAuth <- submit p.custodian do
+    createCmd WeightConfirmationAuthority with
+      custodian = p.custodian
+      weighmasterRoleCid = weighmasterRole
+      weighDeviceRoleCid = weighDeviceRole
+      configToleranceGrams = defaultSystemParams.weightMatchToleranceGrams
+  confirmedWeight <- submit p.custodian do
+    exerciseCmd weightAuth ConfirmWeight with humanAttCid = hAtt, deviceAttCid = dAtt, location = "Zurich-B"
+  (_mvReconciled, _presenceAtt, _idxAtt3, idxReconciled) <- submitMulti [p.custodian, p.vaultKeeper] [] do
+    exerciseCmd mvReceived ReconcileBar with
+      actorRoleCid = vaultKeeperRole
+      actor = p.vaultKeeper
+      confirmedWeightCid = confirmedWeight
+      indexCid = idxAtt2
+      movementIndexCid = idxReceived
+      evidenceHash = "transit-reconciled"
+
+  movementCheckReconciled <- submit p.complianceProvider do
+    createCmd MovementCheck with
+      provider = p.complianceProvider
+      custodian = p.custodian
+      movementIndexCid = idxReconciled
+      backingSerials = ["BAR-TRANSIT-1"]
+  esc2 <- submitMulti [p.custodian, p.investor1] [] do
+    exerciseCmd esc ReconfigureChecks with
+      newChecks =
+        [ toInterfaceContractId @ComplianceCheck kycCid
+        , toInterfaceContractId @ComplianceCheck movementCheckReconciled
+        ]
+  (goldOut, _cashOut) <- submitMulti [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd esc2 Settle
+  Some gold <- queryContractId p.investor1 goldOut
+  assertMsg "transit lockdown lifted after reconciliation" (gold.owner == p.investor1)
+
+-- | An audit finds a discrepancy: the custodian alone cannot resolve it, the
+-- vault site is locked out of new trades while it's open, and a joint
+-- write-down both shrinks the ledger and reopens trading for what remains.
+auditCrisis = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  assayerRole <- appoint b p.assayer Assayer "Zurich-A" (days 30)
+  bs <- registerAndAssay b assayerRole b.registryCid b.indexCid "BAR-CRISIS-1" 1000.0 0.999
+  (goldCid, ledger1) <- mintGold b bs b.ledgerCid p.custodian 200.0
+
+  auditorRole <- appoint b p.auditor Auditor "Zurich-A" (days 30)
+  authorityCid <- submit p.custodian do
+    createCmd AuditorAuthority with
+      custodian = p.custodian
+      auditor = p.auditor
+      roleCid = auditorRole
+      discrepancyIndexCid = b.discrepancyIndexCid
+  (auditAttCid, _auditIdx) <- submit p.auditor do
+    exerciseCmd auditorRole SubmitAttestation with
+      indexCid = bs.indexCid
+      barSerial = "BAR-CRISIS-1"
+      payload = AuditResultPayload with findingsHash = "crisis-finding", passed = False
+      evidenceHash = "crisis-ev"
+      deviceId = None
+  (reportCid, idxOpen) <- submit p.auditor do
+    exerciseCmd authorityCid FileDiscrepancy with
+      vaultSite = "Zurich-A"
+      affectedSerials = ["BAR-CRISIS-1"]
+      auditAttestationCid = auditAttCid
+      rationale = "Suspected shortfall discovered during routine audit"
+
+  -- Crisis rule: the custodian cannot unilaterally wave the problem away.
+  submitMustFail p.custodian do
+    exerciseCmd reportCid MarkResolved
+
+  -- Trading at the affected vault site is locked out while the report is open.
+  kycCid <- submit p.complianceProvider do
+    createCmd KYCCheck with
+      provider = p.complianceProvider
+      subject = p.investor1
+      validUntil = time (date 2030 Jan 1) 0 0 0
+  noOpenCheck <- submit p.complianceProvider do
+    createCmd NoOpenDiscrepancyCheck with
+      provider = p.complianceProvider
+      custodian = p.custodian
+      discrepancyIndexCid = idxOpen
+      vaultSite = "Zurich-A"
+  cashCid <- submit p.cashIssuer do
+    exerciseCmd b.cashIssuerCid IssueCash with owner = p.investor1, amount = 300.0, currencyId = "USD"
+  prop <- submit p.custodian do
+    createCmd EscrowProposal with
+      seller = p.custodian
+      buyer = p.investor1
+      goldCid
+      cashAmount = 300.0
+      cashIssuer = p.cashIssuer
+      requiredChecks =
+        [ toInterfaceContractId @ComplianceCheck kycCid
+        , toInterfaceContractId @ComplianceCheck noOpenCheck
+        ]
+      configCid = b.configCid
+      expiryOverride = None
+  esc <- submitMulti [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd prop AcceptAndFund with cashHoldingCid = cashCid
+  submitMultiMustFail [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd esc Settle
+
+  -- Settle failed, so the gold is still locked inside the escrow, not under
+  -- the original goldCid (AcceptAndFund already re-created it as escrow-held).
+  Some lockedEscrow <- queryContractId p.custodian esc
+  let lockedGoldCid = lockedEscrow.goldCid
+
+  -- Joint write-down: haircut resolves the report and shrinks the holding.
+  (_newLedger, remainingOpt) <- submitMulti [p.custodian, p.auditor] [] do
+    exerciseCmd reportCid WriteDown with
+      holdingCid = lockedGoldCid
+      ledgerCid = ledger1
+      serial = "BAR-CRISIS-1"
+      burnGrams = 50.0
+      discrepancyIndexCid = idxOpen
+  Some remainingGoldCid <- pure remainingOpt
+  Some remainingGold <- queryContractId p.custodian remainingGoldCid
+  assertMsg "write-down shrinks the holding by the haircut" (remainingGold.amountGrams == 150.0)
+
+  -- Trading resumes for the remainder once the report is resolved.
+  [(idxResolved, _)] <- query @DiscrepancyIndex p.custodian
+  noOpenCheckResolved <- submit p.complianceProvider do
+    createCmd NoOpenDiscrepancyCheck with
+      provider = p.complianceProvider
+      custodian = p.custodian
+      discrepancyIndexCid = idxResolved
+      vaultSite = "Zurich-A"
+  cash2 <- submit p.cashIssuer do
+    exerciseCmd b.cashIssuerCid IssueCash with owner = p.investor1, amount = 250.0, currencyId = "USD"
+  prop2 <- submit p.custodian do
+    createCmd EscrowProposal with
+      seller = p.custodian
+      buyer = p.investor1
+      goldCid = remainingGoldCid
+      cashAmount = 250.0
+      cashIssuer = p.cashIssuer
+      requiredChecks =
+        [ toInterfaceContractId @ComplianceCheck kycCid
+        , toInterfaceContractId @ComplianceCheck noOpenCheckResolved
+        ]
+      configCid = b.configCid
+      expiryOverride = None
+  esc2 <- submitMulti [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd prop2 AcceptAndFund with cashHoldingCid = cash2
+  (goldOut, _cashOut) <- submitMulti [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd esc2 Settle
+  Some gold <- queryContractId p.investor1 goldOut
+  assertMsg "trading resumes once the audit crisis is resolved" (gold.owner == p.investor1 && gold.amountGrams == 150.0)
+
+-- | Daml's privacy model in action: contracts are visible only to their
+-- signatories/observers. An unrelated investor cannot see another investor's
+-- holdings, compliance checks about them, or a discrepancy report they aren't
+-- party to — even though both are onboarded onto the very same ledger.
+privacyAssertions = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  assayerRole <- appoint b p.assayer Assayer "Zurich-A" (days 30)
+  bs <- registerAndAssay b assayerRole b.registryCid b.indexCid "BAR-PRIV-1" 1000.0 0.999
+  (goldCid, _ledger1) <- mintGold b bs b.ledgerCid p.investor1 40.0
+  cashCid <- submit p.cashIssuer do
+    exerciseCmd b.cashIssuerCid IssueCash with owner = p.investor1, amount = 100.0, currencyId = "USD"
+  kycCid <- submit p.complianceProvider do
+    createCmd KYCCheck with
+      provider = p.complianceProvider
+      subject = p.investor1
+      validUntil = time (date 2030 Jan 1) 0 0 0
+
+  auditorRole <- appoint b p.auditor Auditor "Zurich-A" (days 30)
+  authorityCid <- submit p.custodian do
+    createCmd AuditorAuthority with
+      custodian = p.custodian
+      auditor = p.auditor
+      roleCid = auditorRole
+      discrepancyIndexCid = b.discrepancyIndexCid
+  (auditAttCid, _auditIdx) <- submit p.auditor do
+    exerciseCmd auditorRole SubmitAttestation with
+      indexCid = bs.indexCid
+      barSerial = "BAR-PRIV-1"
+      payload = AuditResultPayload with findingsHash = "priv-finding", passed = False
+      evidenceHash = "priv-ev"
+      deviceId = None
+  (reportCid, _idxOpen) <- submit p.auditor do
+    exerciseCmd authorityCid FileDiscrepancy with
+      vaultSite = "Zurich-A"
+      affectedSerials = ["BAR-PRIV-1"]
+      auditAttestationCid = auditAttCid
+      rationale = "Confidential audit finding not shared with investors"
+
+  -- investor2 is a legitimate, onboarded party — but is stakeholder to none
+  -- of investor1's private contracts or the custodian/auditor's report.
+  goldSeenByOther <- queryContractId p.investor2 goldCid
+  cashSeenByOther <- queryContractId p.investor2 cashCid
+  kycSeenByOther <- queryContractId p.investor2 kycCid
+  reportSeenByOther <- queryContractId p.investor2 reportCid
+  assertMsg "investor2 cannot see investor1's gold holding" (isNone goldSeenByOther)
+  assertMsg "investor2 cannot see investor1's cash holding" (isNone cashSeenByOther)
+  assertMsg "investor2 cannot see investor1's KYC check" (isNone kycSeenByOther)
+  assertMsg "investor2 cannot see the custodian/auditor's discrepancy report" (isNone reportSeenByOther)
+
+  -- The rightful stakeholders, meanwhile, see exactly what they need to.
+  goldSeenByOwner <- queryContractId p.investor1 goldCid
+  reportSeenByAuditor <- queryContractId p.auditor reportCid
+  reportSeenByInvestor1 <- queryContractId p.investor1 reportCid
+  assertMsg "investor1 sees its own gold holding" (not (isNone goldSeenByOwner))
+  assertMsg "auditor sees the report it filed" (not (isNone reportSeenByAuditor))
+  assertMsg "investor1 is not a stakeholder of the audit report either" (isNone reportSeenByInvestor1)

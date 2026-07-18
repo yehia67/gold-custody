@@ -1,0 +1,210 @@
+module Scripts.TestDiscrepancy where
+
+import Daml.Script
+import DA.Date (Month(..), date)
+import DA.Time (time, days)
+import Config
+import Attestations
+import Operators
+import Discrepancy
+import Compliance
+import Escrow
+import Token
+import Scripts.Setup
+  ( allocateParties, bootstrapSystem, appoint, registerAndAssay, mintGold
+  , Bootstrap(..)
+  )
+
+-- | Common fixture: an appointed Auditor + an AuditorAuthority wired to the
+-- shared DiscrepancyIndex, plus a fresh AuditResult attestation to file with.
+data DiscrepancyFixture = DiscrepancyFixture with
+    auditorRole : ContractId OperatorRole
+    authorityCid : ContractId AuditorAuthority
+    auditAttCid : ContractId Attestation
+    indexCid : ContractId AttestationIndex
+  deriving (Eq)
+
+-- | discrepancyIndexCid/indexCid must be passed in (rather than always reading
+-- b.discrepancyIndexCid/b.indexCid) since FileDiscrepancy reads the former off
+-- the AuditorAuthority record, and any prior registerAndAssay/SubmitAttestation
+-- call already archives the bootstrap AttestationIndex cid.
+setupDiscrepancyFixture
+  :  Bootstrap -> ContractId DiscrepancyIndex -> ContractId AttestationIndex -> Text
+  -> Script DiscrepancyFixture
+setupDiscrepancyFixture b discrepancyIndexCid indexCid serial = do
+  let p = b.parties
+  auditorRole <- appoint b p.auditor Auditor "Zurich-A" (days 30)
+  authorityCid <- submit p.custodian do
+    createCmd AuditorAuthority with
+      custodian = p.custodian
+      auditor = p.auditor
+      roleCid = auditorRole
+      discrepancyIndexCid
+  (auditAttCid, newIdx) <- submit p.auditor do
+    exerciseCmd auditorRole SubmitAttestation with
+      indexCid
+      barSerial = serial
+      payload = AuditResultPayload with findingsHash = "audit-" <> serial, passed = False
+      evidenceHash = "audit-ev-" <> serial
+      deviceId = None
+  pure DiscrepancyFixture with auditorRole, authorityCid, auditAttCid, indexCid = newIdx
+
+testCustodianCannotUnilaterallyResolve = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  fx <- setupDiscrepancyFixture b b.discrepancyIndexCid b.indexCid "BAR-DISC-1"
+  (reportCid, _idx) <- submit p.auditor do
+    exerciseCmd fx.authorityCid FileDiscrepancy with
+      vaultSite = "Zurich-A"
+      affectedSerials = ["BAR-DISC-1"]
+      auditAttestationCid = fx.auditAttCid
+      rationale = "Weight mismatch on reconciliation"
+  -- MarkResolved is jointly controlled by custodian, auditor — custodian alone
+  -- (or auditor alone) cannot unilaterally resolve.
+  submitMustFail p.custodian do
+    exerciseCmd reportCid MarkResolved
+  submitMustFail p.auditor do
+    exerciseCmd reportCid MarkResolved
+  resolved <- submitMulti [p.custodian, p.auditor] [] do
+    exerciseCmd reportCid MarkResolved
+  Some report <- queryContractId p.custodian resolved
+  assertMsg "jointly resolved" report.resolved
+
+testWriteDownReducesHoldingsAndLedger = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  assayerRole <- appoint b p.assayer Assayer "Zurich-A" (days 30)
+  bs <- registerAndAssay b assayerRole b.registryCid b.indexCid "BAR-DISC-2" 1000.0 0.999
+  (goldCid, ledger1) <- mintGold b bs b.ledgerCid p.custodian 100.0
+  fx <- setupDiscrepancyFixture b b.discrepancyIndexCid bs.indexCid "BAR-DISC-2"
+  (reportCid, idx1) <- submit p.auditor do
+    exerciseCmd fx.authorityCid FileDiscrepancy with
+      vaultSite = "Zurich-A"
+      affectedSerials = ["BAR-DISC-2"]
+      auditAttestationCid = fx.auditAttCid
+      rationale = "Partial shortfall found on assay"
+
+  -- Haircut: burnGrams (30) < holding amount (100) -> holding reduced, ledger reduced.
+  (ledger2, remainingOpt) <- submitMulti [p.custodian, p.auditor] [] do
+    exerciseCmd reportCid WriteDown with
+      holdingCid = goldCid
+      ledgerCid = ledger1
+      serial = "BAR-DISC-2"
+      burnGrams = 30.0
+      discrepancyIndexCid = idx1
+  Some remainingCid <- pure remainingOpt
+  Some remainingHolding <- queryContractId p.custodian remainingCid
+  assertMsg "holding reduced by haircut" (remainingHolding.amountGrams == 70.0)
+  Some ledgerAfterHaircut <- queryContractId p.custodian ledger2
+  assertMsg "ledger reduced by haircut" (findAmount "BAR-DISC-2" ledgerAfterHaircut.minted == 70.0)
+
+  -- The report is already resolved by WriteDown, so a second discrepancy must
+  -- be filed to fully burn the remainder. WriteDown doesn't hand back the
+  -- updated DiscrepancyIndex cid, so look it up via query instead.
+  [(idxAfterFirstWriteDown, _)] <- query @DiscrepancyIndex p.custodian
+  fx2 <- setupDiscrepancyFixture b idxAfterFirstWriteDown fx.indexCid "BAR-DISC-2"
+  (reportCid2, idx2) <- submit p.auditor do
+    exerciseCmd fx2.authorityCid FileDiscrepancy with
+      vaultSite = "Zurich-A"
+      affectedSerials = ["BAR-DISC-2"]
+      auditAttestationCid = fx2.auditAttCid
+      rationale = "Remainder written off entirely"
+  (ledger3, remainingOpt2) <- submitMulti [p.custodian, p.auditor] [] do
+    exerciseCmd reportCid2 WriteDown with
+      holdingCid = remainingCid
+      ledgerCid = ledger2
+      serial = "BAR-DISC-2"
+      burnGrams = 70.0
+      discrepancyIndexCid = idx2
+  assertMsg "full burn leaves no remaining holding" (remainingOpt2 == None)
+  Some ledgerAfterBurn <- queryContractId p.custodian ledger3
+  assertMsg "ledger fully burned" (findAmount "BAR-DISC-2" ledgerAfterBurn.minted == 0.0)
+
+testEscrowBlockedWhileDiscrepancyOpen = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  assayerRole <- appoint b p.assayer Assayer "Zurich-A" (days 30)
+  bs <- registerAndAssay b assayerRole b.registryCid b.indexCid "BAR-DISC-3" 1000.0 0.999
+  (goldCid1, ledger1) <- mintGold b bs b.ledgerCid p.custodian 50.0
+  (goldCid2, _ledger2) <- mintGold b bs ledger1 p.custodian 40.0
+
+  kycCid <- submit p.complianceProvider do
+    createCmd KYCCheck with
+      provider = p.complianceProvider
+      subject = p.investor1
+      validUntil = time (date 2026 Dec 1) 0 0 0
+  limCid <- submit p.complianceProvider do
+    createCmd LimitCheck with
+      provider = p.complianceProvider
+      maxTransfer = 1000000.0
+      observers = [p.investor1]
+  let kycAndLimit = [toInterfaceContractId @ComplianceCheck kycCid, toInterfaceContractId @ComplianceCheck limCid]
+
+  fx <- setupDiscrepancyFixture b b.discrepancyIndexCid bs.indexCid "BAR-DISC-3"
+  (reportCid, idxOpen) <- submit p.auditor do
+    exerciseCmd fx.authorityCid FileDiscrepancy with
+      vaultSite = "Zurich-A"
+      affectedSerials = ["BAR-DISC-3"]
+      auditAttestationCid = fx.auditAttCid
+      rationale = "Investigating count mismatch at Zurich-A"
+
+  noOpenCheckWhileOpen <- submit p.complianceProvider do
+    createCmd NoOpenDiscrepancyCheck with
+      provider = p.complianceProvider
+      custodian = p.custodian
+      discrepancyIndexCid = idxOpen
+      vaultSite = "Zurich-A"
+  let checksBlocked = kycAndLimit <> [toInterfaceContractId @ComplianceCheck noOpenCheckWhileOpen]
+
+  cash1 <- submit p.cashIssuer do
+    exerciseCmd b.cashIssuerCid IssueCash with owner = p.investor1, amount = 250.0, currencyId = "USD"
+  prop1 <- submit p.custodian do
+    createCmd EscrowProposal with
+      seller = p.custodian
+      buyer = p.investor1
+      goldCid = goldCid1
+      cashAmount = 250.0
+      cashIssuer = p.cashIssuer
+      requiredChecks = checksBlocked
+      configCid = b.configCid
+      expiryOverride = None
+  esc1 <- submitMulti [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd prop1 AcceptAndFund with cashHoldingCid = cash1
+  -- Blocked: there is still an open (unresolved) discrepancy for Zurich-A.
+  submitMultiMustFail [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd esc1 Settle
+
+  -- Resolve the discrepancy report, freeing the vault site.
+  _ <- submitMulti [p.custodian, p.auditor] [] do
+    exerciseCmd reportCid MarkResolved
+  idxResolved <- submit p.custodian do
+    exerciseCmd idxOpen MarkEntryResolved with reportCid
+
+  noOpenCheckResolved <- submit p.complianceProvider do
+    createCmd NoOpenDiscrepancyCheck with
+      provider = p.complianceProvider
+      custodian = p.custodian
+      discrepancyIndexCid = idxResolved
+      vaultSite = "Zurich-A"
+  let checksUnblocked = kycAndLimit <> [toInterfaceContractId @ComplianceCheck noOpenCheckResolved]
+  cash2 <- submit p.cashIssuer do
+    exerciseCmd b.cashIssuerCid IssueCash with owner = p.investor1, amount = 200.0, currencyId = "USD"
+  prop2 <- submit p.custodian do
+    createCmd EscrowProposal with
+      seller = p.custodian
+      buyer = p.investor1
+      goldCid = goldCid2
+      cashAmount = 200.0
+      cashIssuer = p.cashIssuer
+      requiredChecks = checksUnblocked
+      configCid = b.configCid
+      expiryOverride = None
+  esc2 <- submitMulti [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd prop2 AcceptAndFund with cashHoldingCid = cash2
+  (goldOut, _cashOut) <- submitMulti [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd esc2 Settle
+  Some gold <- queryContractId p.investor1 goldOut
+  assertMsg "buyer received gold after resolution" (gold.owner == p.investor1 && gold.amountGrams == 40.0)

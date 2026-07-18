@@ -1,0 +1,224 @@
+module Scripts.TestMovement where
+
+import Daml.Script
+import DA.Date (Month(..), date)
+import DA.Time (time, days)
+import Config
+import Attestations
+import Operators
+import Movement
+import Compliance
+import Escrow
+import Token
+import Scripts.Setup
+  ( allocateParties, bootstrapSystem, appoint, registerAndAssay, mintGold
+  , Bootstrap(..)
+  )
+
+-- | Common fixture: a registered/assayed bar, appointed Transporter +
+-- VaultKeeper roles, and a MovementFactory wired to the shared MovementIndex.
+data MovementFixture = MovementFixture with
+    barSerial : Text
+    transporterRole : ContractId OperatorRole
+    vaultKeeperRole : ContractId OperatorRole
+    factoryCid : ContractId MovementFactory
+  deriving (Eq)
+
+setupMovementFixture : Bootstrap -> Text -> Script MovementFixture
+setupMovementFixture b serial = do
+  let p = b.parties
+  transporterRole <- appoint b p.transporter Transporter "Zurich-A" (days 30)
+  vaultKeeperRole <- appoint b p.vaultKeeper VaultKeeper "Zurich-A" (days 30)
+  factoryCid <- submit p.custodian do
+    createCmd MovementFactory with
+      custodian = p.custodian
+      transporterRoleCid = transporterRole
+      vaultKeeperRoleCid = vaultKeeperRole
+      movementIndexCid = b.movementIndexCid
+  pure MovementFixture with barSerial = serial, transporterRole, vaultKeeperRole, factoryCid
+
+testOutOfOrderFails = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  fx <- setupMovementFixture b "BAR-MV-1"
+  (mv, idxRequested) <- submit p.custodian do
+    exerciseCmd fx.factoryCid RequestMovement with
+      barSerial = fx.barSerial
+      fromLocation = "Zurich-A"
+      toLocation = "Zurich-B"
+      requester = p.custodian
+  -- Still Requested: ReceiveBar (which requires Released) must fail.
+  submitMustFail p.custodian do
+    exerciseCmd mv ReceiveBar with actorRoleCid = fx.transporterRole, movementIndexCid = idxRequested
+  -- Release it properly, then trying to act on the now-stale/archived original
+  -- movement cid (as if releasing again, out of order) must fail.
+  (mvReleased, idxReleased) <- submit p.custodian do
+    exerciseCmd mv ReleaseBar with movementIndexCid = idxRequested
+  submitMustFail p.custodian do
+    exerciseCmd mv ReleaseBar with movementIndexCid = idxReleased
+  -- And Receive is not yet valid to skip straight to Reconcile-adjacent state
+  -- checks: attempting Receive with the wrong role on the correctly-released
+  -- movement is covered by testWrongRoleFails; here, receiving twice on an
+  -- already-received movement (double receive) must fail.
+  (_mvReceived, idxReceived) <- submit p.custodian do
+    exerciseCmd mvReleased ReceiveBar with
+      actorRoleCid = fx.transporterRole
+      movementIndexCid = idxReleased
+  submitMustFail p.custodian do
+    exerciseCmd mvReleased ReceiveBar with
+      actorRoleCid = fx.transporterRole
+      movementIndexCid = idxReceived
+
+testWrongRoleFails = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  fx <- setupMovementFixture b "BAR-MV-2"
+  (mv, idx1) <- submit p.custodian do
+    exerciseCmd fx.factoryCid RequestMovement with
+      barSerial = fx.barSerial
+      fromLocation = "Zurich-A"
+      toLocation = "Zurich-B"
+      requester = p.custodian
+  (mvReleased, idxReleased) <- submit p.custodian do
+    exerciseCmd mv ReleaseBar with movementIndexCid = idx1
+  -- Passing the VaultKeeper role where Transporter is required must fail.
+  submitMustFail p.custodian do
+    exerciseCmd mvReleased ReceiveBar with
+      actorRoleCid = fx.vaultKeeperRole
+      movementIndexCid = idxReleased
+
+testMovementCheckBlocksThenUnblocksEscrow = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  fx <- setupMovementFixture b "BAR-MV-3"
+  assayerRole <- appoint b p.assayer Assayer "Zurich-A" (days 30)
+  bs <- registerAndAssay b assayerRole b.registryCid b.indexCid fx.barSerial 1000.0 0.999
+  (goldCid1, ledger1) <- mintGold b bs b.ledgerCid p.custodian 50.0
+  (goldCid2, ledger2) <- mintGold b bs ledger1 p.custodian 40.0
+
+  kycCid <- submit p.complianceProvider do
+    createCmd KYCCheck with
+      provider = p.complianceProvider
+      subject = p.investor1
+      validUntil = time (date 2026 Dec 1) 0 0 0
+  limCid <- submit p.complianceProvider do
+    createCmd LimitCheck with
+      provider = p.complianceProvider
+      maxTransfer = 1000000.0
+      observers = [p.investor1]
+  let kycAndLimit = [toInterfaceContractId @ComplianceCheck kycCid, toInterfaceContractId @ComplianceCheck limCid]
+
+  -- Kick off the movement (BarMovement is Requested — an "open" movement).
+  (mv, idxRequested) <- submit p.custodian do
+    exerciseCmd fx.factoryCid RequestMovement with
+      barSerial = fx.barSerial
+      fromLocation = "Zurich-A"
+      toLocation = "Zurich-B"
+      requester = p.custodian
+
+  movementCheckOpen <- submit p.complianceProvider do
+    createCmd MovementCheck with
+      provider = p.complianceProvider
+      custodian = p.custodian
+      movementIndexCid = idxRequested
+      backingSerials = [fx.barSerial]
+  let checksBlocked = kycAndLimit <> [toInterfaceContractId @ComplianceCheck movementCheckOpen]
+
+  cash1 <- submit p.cashIssuer do
+    exerciseCmd b.cashIssuerCid IssueCash with owner = p.investor1, amount = 250.0, currencyId = "USD"
+  prop1 <- submit p.custodian do
+    createCmd EscrowProposal with
+      seller = p.custodian
+      buyer = p.investor1
+      goldCid = goldCid1
+      cashAmount = 250.0
+      cashIssuer = p.cashIssuer
+      requiredChecks = checksBlocked
+      configCid = b.configCid
+      expiryOverride = None
+  esc1 <- submitMulti [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd prop1 AcceptAndFund with cashHoldingCid = cash1
+  -- Blocked: the bar backing this holding has an open (non-Reconciled) movement.
+  submitMultiMustFail [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd esc1 Settle
+
+  -- Drive the movement all the way to Reconciled.
+  (mvReleased, idxReleased) <- submit p.custodian do
+    exerciseCmd mv ReleaseBar with movementIndexCid = idxRequested
+  (mvReceived, idxReceived) <- submit p.custodian do
+    exerciseCmd mvReleased ReceiveBar with
+      actorRoleCid = fx.transporterRole
+      movementIndexCid = idxReleased
+
+  weighmasterRole <- appoint b p.weighmaster Weighmaster "Zurich-B" (days 30)
+  weighDeviceRole <- appoint b p.weighDevice WeighDevice "Zurich-B" (days 30)
+  (hAtt, idxAtt1) <- submit p.weighmaster do
+    exerciseCmd weighmasterRole SubmitAttestation with
+      indexCid = bs.indexCid
+      barSerial = fx.barSerial
+      payload = WeightPayload 999.0
+      evidenceHash = "wm-dest"
+      deviceId = None
+  (dAtt, idxAtt2) <- submit p.weighDevice do
+    exerciseCmd weighDeviceRole SubmitAttestation with
+      indexCid = idxAtt1
+      barSerial = fx.barSerial
+      payload = WeightPayload 999.0
+      evidenceHash = "wd-dest"
+      deviceId = Some "SCALE-DEST"
+  weightAuth <- submit p.custodian do
+    createCmd WeightConfirmationAuthority with
+      custodian = p.custodian
+      weighmasterRoleCid = weighmasterRole
+      weighDeviceRoleCid = weighDeviceRole
+      configToleranceGrams = defaultSystemParams.weightMatchToleranceGrams
+  confirmedWeight <- submit p.custodian do
+    exerciseCmd weightAuth ConfirmWeight with
+      humanAttCid = hAtt
+      deviceAttCid = dAtt
+      location = "Zurich-B"
+
+  (_mvReconciled, _presenceAtt, _idxAtt3, idxReconciled) <- submitMulti [p.custodian, p.vaultKeeper] [] do
+    exerciseCmd mvReceived ReconcileBar with
+      actorRoleCid = fx.vaultKeeperRole
+      actor = p.vaultKeeper
+      confirmedWeightCid = confirmedWeight
+      indexCid = idxAtt2
+      movementIndexCid = idxReceived
+      evidenceHash = "reconciled"
+
+  -- Unblocked: create a fresh MovementCheck against the now-Reconciled index
+  -- and settle a second escrow for the same backing serial.
+  movementCheckReconciled <- submit p.complianceProvider do
+    createCmd MovementCheck with
+      provider = p.complianceProvider
+      custodian = p.custodian
+      movementIndexCid = idxReconciled
+      backingSerials = [fx.barSerial]
+  let checksUnblocked = kycAndLimit <> [toInterfaceContractId @ComplianceCheck movementCheckReconciled]
+  cash2 <- submit p.cashIssuer do
+    exerciseCmd b.cashIssuerCid IssueCash with owner = p.investor1, amount = 200.0, currencyId = "USD"
+  prop2 <- submit p.custodian do
+    createCmd EscrowProposal with
+      seller = p.custodian
+      buyer = p.investor1
+      goldCid = goldCid2
+      cashAmount = 200.0
+      cashIssuer = p.cashIssuer
+      requiredChecks = checksUnblocked
+      configCid = b.configCid
+      expiryOverride = None
+  esc2 <- submitMulti [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd prop2 AcceptAndFund with cashHoldingCid = cash2
+  (goldOut, _cashOut) <- submitMulti [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd esc2 Settle
+  Some gold <- queryContractId p.investor1 goldOut
+  assertMsg "buyer received gold after reconciliation" (gold.owner == p.investor1 && gold.amountGrams == 40.0)
+
+  -- The still-blocked first escrow remains un-settleable via the stale check
+  -- (movementCheckOpen still points at the pre-reconciliation index snapshot).
+  submitMultiMustFail [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd esc1 Settle

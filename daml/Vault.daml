@@ -1,0 +1,57 @@
+module Vault where
+
+-- | Gold bar inventory templates.
+-- NOTE: ensure cannot fetch SystemConfig, so purity vs minPurity is validated
+-- inside CustodianRole.RegisterBar (Operators.daml). Here we keep only structural
+-- invariants (weightGrams > 0.0).
+
+template GoldBar
+  with
+    custodian : Party
+    regulator : Party
+    serialNumber : Text
+    weightGrams : Decimal
+    purity : Decimal
+    vaultLocation : Text
+    custodianRef : Text
+  where
+    signatory custodian
+    observer regulator
+    ensure weightGrams > 0.0
+
+-- | Custodian-signed registry of registered serial numbers.
+-- Canton multi-domain restriction: contract keys MUST NOT be used.
+-- Uniqueness of serials is enforced by this registry pattern instead.
+template SerialRegistry
+  with
+    custodian : Party
+    registeredSerials : [Text]
+  where
+    signatory custodian
+
+    choice AssertSerialAvailable : ()
+      with
+        serial : Text
+      controller custodian
+      do
+        assertMsg ("Serial already registered: " <> serial) (serial `notElem` registeredSerials)
+
+    choice AddSerial : ContractId SerialRegistry
+      with
+        serial : Text
+      controller custodian
+      do
+        assertMsg ("Serial already registered: " <> serial) (serial `notElem` registeredSerials)
+        create this with registeredSerials = serial :: registeredSerials
+
+-- | Links a registered bar to a custodian attestation timestamp.
+template VaultReceipt
+  with
+    custodian : Party
+    regulator : Party
+    barCid : ContractId GoldBar
+    serialNumber : Text
+    attestedAt : Time
+  where
+    signatory custodian
+    observer regulator

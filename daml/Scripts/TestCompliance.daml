@@ -1,0 +1,229 @@
+module Scripts.TestCompliance where
+
+import Daml.Script
+import DA.Date (Month(..), date)
+import DA.Time (days, seconds, time)
+import DA.Optional (isNone)
+import Config
+import Attestations
+import Operators
+import Compliance
+import Movement
+import Discrepancy
+import Escrow
+import Token
+import Splice.Api.Token.HoldingV1 (InstrumentId(..))
+import Splice.Api.Token.MetadataV1 (emptyMetadata)
+import Scripts.Setup (allocateParties, bootstrapSystem, appoint)
+
+testKYCPassAndFail = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  kycCid <- submit p.complianceProvider do
+    createCmd KYCCheck with
+      provider = p.complianceProvider
+      subject = p.investor1
+      validUntil = time (date 2026 Feb 1) 0 0 0
+  let iface = toInterfaceContractId @ComplianceCheck kycCid
+  res <- submit p.investor1 do
+    exerciseCmd iface Validate with subject = p.investor1, amount = 100.0
+  assertMsg "KYC pass" (res == CheckPassed)
+  passTime (days 40)
+  res2 <- submit p.investor1 do
+    exerciseCmd iface Validate with subject = p.investor1, amount = 100.0
+  assertMsg "KYC fail expired" (res2 /= CheckPassed)
+
+testSanctionsPassAndFail = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  okCid <- submit p.complianceProvider do
+    createCmd SanctionsCheck with
+      provider = p.complianceProvider
+      allowedJurisdictions = ["CH", "US"]
+      subjectJurisdiction = "CH"
+      observers = [p.investor1]
+  badCid <- submit p.complianceProvider do
+    createCmd SanctionsCheck with
+      provider = p.complianceProvider
+      allowedJurisdictions = ["CH", "US"]
+      subjectJurisdiction = "XX"
+      observers = [p.investor1]
+  r1 <- submit p.investor1 do
+    exerciseCmd (toInterfaceContractId @ComplianceCheck okCid) Validate with subject = p.investor1, amount = 1.0
+  r2 <- submit p.investor1 do
+    exerciseCmd (toInterfaceContractId @ComplianceCheck badCid) Validate with subject = p.investor1, amount = 1.0
+  assertMsg "sanctions pass" (r1 == CheckPassed)
+  assertMsg "sanctions fail" (r2 /= CheckPassed)
+
+testLimitPassAndFail = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  limCid <- submit p.complianceProvider do
+    createCmd LimitCheck with provider = p.complianceProvider, maxTransfer = 1000.0, observers = [p.investor1]
+  let iface = toInterfaceContractId @ComplianceCheck limCid
+  r1 <- submit p.investor1 do exerciseCmd iface Validate with subject = p.investor1, amount = 500.0
+  r2 <- submit p.investor1 do exerciseCmd iface Validate with subject = p.investor1, amount = 2000.0
+  assertMsg "limit pass" (r1 == CheckPassed)
+  assertMsg "limit fail" (r2 /= CheckPassed)
+
+testConfirmedWeightHappyAndMismatch = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  wm <- appoint b p.weighmaster Weighmaster "Zurich-A" (days 30)
+  wd <- appoint b p.weighDevice WeighDevice "Zurich-A" (days 30)
+  (hAtt, idx1) <- submit p.weighmaster do
+    exerciseCmd wm SubmitAttestation with
+      indexCid = b.indexCid
+      barSerial = "BAR-W"
+      payload = WeightPayload 1000.0
+      evidenceHash = "h1"
+      deviceId = None
+  (dAtt, idx1b) <- submit p.weighDevice do
+    exerciseCmd wd SubmitAttestation with
+      indexCid = idx1
+      barSerial = "BAR-W"
+      payload = WeightPayload 1000.0
+      evidenceHash = "d1"
+      deviceId = Some "SCALE-1"
+  auth <- submit p.custodian do
+    createCmd WeightConfirmationAuthority with
+      custodian = p.custodian
+      weighmasterRoleCid = wm
+      weighDeviceRoleCid = wd
+      configToleranceGrams = defaultSystemParams.weightMatchToleranceGrams
+  cw <- submit p.custodian do
+    exerciseCmd auth ConfirmWeight with humanAttCid = hAtt, deviceAttCid = dAtt, location = "Zurich-A"
+  Some confirmed <- queryContractId p.custodian cw
+  assertMsg "weight" (confirmed.weightGrams == 1000.0)
+
+  -- mismatch
+  (h2, idx2) <- submit p.weighmaster do
+    exerciseCmd wm SubmitAttestation with
+      indexCid = idx1b
+      barSerial = "BAR-W2"
+      payload = WeightPayload 1000.0
+      evidenceHash = "h2"
+      deviceId = None
+  (d2, _) <- submit p.weighDevice do
+    exerciseCmd wd SubmitAttestation with
+      indexCid = idx2
+      barSerial = "BAR-W2"
+      payload = WeightPayload 1010.0
+      evidenceHash = "d2"
+      deviceId = Some "SCALE-1"
+  submitMustFail p.custodian do
+    exerciseCmd auth ConfirmWeight with humanAttCid = h2, deviceAttCid = d2, location = "Zurich-A"
+
+testConfirmedWeightSameAttestorFails = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  wm <- appoint b p.weighmaster Weighmaster "Zurich-A" (days 30)
+  -- Appoint weighdevice role to same party as weighmaster to force same attestor
+  wdSame <- submit p.custodian do
+    exerciseCmd b.custodianRoleCid AppointOperator with
+      operator = p.weighmaster
+      role = WeighDevice
+      site = "Zurich-A"
+      permissions = defaultPermissions WeighDevice
+      validFor = days 30
+  (hAtt, idx1) <- submit p.weighmaster do
+    exerciseCmd wm SubmitAttestation with
+      indexCid = b.indexCid
+      barSerial = "BAR-S"
+      payload = WeightPayload 1000.0
+      evidenceHash = "h1"
+      deviceId = None
+  (dAtt, _) <- submit p.weighmaster do
+    exerciseCmd wdSame SubmitAttestation with
+      indexCid = idx1
+      barSerial = "BAR-S"
+      payload = WeightPayload 1000.0
+      evidenceHash = "d1"
+      deviceId = Some "SCALE-1"
+  auth <- submit p.custodian do
+    createCmd WeightConfirmationAuthority with
+      custodian = p.custodian
+      weighmasterRoleCid = wm
+      weighDeviceRoleCid = wdSame
+      configToleranceGrams = defaultSystemParams.weightMatchToleranceGrams
+  submitMustFail p.custodian do
+    exerciseCmd auth ConfirmWeight with humanAttCid = hAtt, deviceAttCid = dAtt, location = "Zurich-A"
+
+-- | Data-driven checks: same Escrow template, different check lists.
+-- Asserts Escrow.daml needs zero changes when adding PresenceFreshnessCheck to the list.
+testChecksAreDataEscrow = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  -- mint path abbreviated: create gold+cash directly for escrow test
+  goldCid <- submit p.custodian do
+    createCmd GoldHolding with
+      issuer = p.custodian
+      owner = p.custodian
+      amountGrams = 100.0
+      backingSerials = ["BAR-E"]
+      instrumentId = InstrumentId with admin = p.custodian, id = "XAU"
+      lock = None
+      meta = emptyMetadata
+  -- Transfer gold to seller (custodian is seller)
+  cashCid <- submit p.cashIssuer do
+    exerciseCmd b.cashIssuerCid IssueCash with owner = p.investor1, amount = 500.0, currencyId = "USD"
+  kycCid <- submit p.complianceProvider do
+    createCmd KYCCheck with
+      provider = p.complianceProvider
+      subject = p.investor1
+      validUntil = time (date 2026 Dec 1) 0 0 0
+  limCid <- submit p.complianceProvider do
+    createCmd LimitCheck with provider = p.complianceProvider, maxTransfer = 100000.0, observers = [p.investor1]
+  let checks13 = [toInterfaceContractId @ComplianceCheck kycCid, toInterfaceContractId @ComplianceCheck limCid]
+  prop1 <- submit p.custodian do
+    createCmd EscrowProposal with
+      seller = p.custodian
+      buyer = p.investor1
+      goldCid
+      cashAmount = 500.0
+      cashIssuer = p.cashIssuer
+      requiredChecks = checks13
+      configCid = b.configCid
+      expiryOverride = None
+  esc1 <- submitMulti [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd prop1 AcceptAndFund with cashHoldingCid = cashCid
+  (g1, c1) <- submitMulti [p.investor1, p.cashIssuer] [p.custodian] do exerciseCmd esc1 Settle
+  Some g <- queryContractId p.investor1 g1
+  assertMsg "buyer got gold" (g.owner == p.investor1)
+
+  -- Second escrow with PresenceFreshnessCheck — presence stale → settle fails
+  gold2 <- submit p.custodian do
+    createCmd GoldHolding with
+      issuer = p.custodian
+      owner = p.custodian
+      amountGrams = 50.0
+      backingSerials = ["BAR-E2"]
+      instrumentId = InstrumentId with admin = p.custodian, id = "XAU"
+      lock = None
+      meta = emptyMetadata
+  cash2 <- submit p.cashIssuer do
+    exerciseCmd b.cashIssuerCid IssueCash with owner = p.investor1, amount = 250.0, currencyId = "USD"
+  presenceCheck <- submit p.complianceProvider do
+    createCmd PresenceFreshnessCheck with
+      provider = p.complianceProvider
+      custodian = p.custodian
+      configCid = b.configCid
+      indexCid = b.indexCid
+      backingSerials = ["BAR-E2"]
+  let checks135 = checks13 <> [toInterfaceContractId @ComplianceCheck presenceCheck]
+  prop2 <- submit p.custodian do
+    createCmd EscrowProposal with
+      seller = p.custodian
+      buyer = p.investor1
+      goldCid = gold2
+      cashAmount = 250.0
+      cashIssuer = p.cashIssuer
+      requiredChecks = checks135
+      configCid = b.configCid
+      expiryOverride = None
+  esc2 <- submitMulti [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd prop2 AcceptAndFund with cashHoldingCid = cash2
+  submitMultiMustFail [p.investor1, p.cashIssuer] [p.custodian] do exerciseCmd esc2 Settle

@@ -1,0 +1,57 @@
+module Config where
+
+import DA.Time (RelTime, seconds)
+
+-- | Typed system-wide business parameters.
+-- All modules that need these values must fetch SystemConfig (or receive its ContractId).
+-- Choice bodies MUST NOT hardcode these parameters as literals.
+data SystemParams = SystemParams with
+    minPurity : Decimal
+    attestationMaxAge : RelTime
+    assayValidity : RelTime
+    navValidity : RelTime
+    escrowDefaultExpiry : RelTime
+    maxOracleDivergenceBps : Int
+    proofOfReserveMaxAge : RelTime
+    gramsPerUnit : Decimal
+    weightMatchToleranceGrams : Decimal
+    inKindRedemptionThresholdGrams : Decimal
+  deriving (Eq, Show)
+
+-- | Defaults used only at bootstrap / test fixture construction.
+-- Values mirror config/localnet.yaml business section.
+defaultSystemParams : SystemParams
+defaultSystemParams = SystemParams with
+    minPurity = 0.995
+    attestationMaxAge = seconds 86400
+    assayValidity = seconds 2592000
+    navValidity = seconds 3600
+    escrowDefaultExpiry = seconds 86400
+    maxOracleDivergenceBps = 50
+    proofOfReserveMaxAge = seconds 604800
+    gramsPerUnit = 1.0
+    weightMatchToleranceGrams = 0.01
+    inKindRedemptionThresholdGrams = 1000.0
+
+template SystemConfig
+  with
+    operator : Party
+    params : SystemParams
+    observers : [Party]
+  where
+    signatory operator
+    observer observers
+
+    -- | Archive and recreate with new params. Returns the new contract id.
+    choice UpdateConfig : ContractId SystemConfig
+      with
+        newParams : SystemParams
+      controller operator
+      do
+        create this with params = newParams
+
+-- | Helper for consumers: fetch params from a config cid.
+fetchParams : ContractId SystemConfig -> Update SystemParams
+fetchParams cfgCid = do
+  cfg <- fetch cfgCid
+  pure cfg.params

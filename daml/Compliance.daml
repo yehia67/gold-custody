@@ -1,0 +1,218 @@
+module Compliance where
+
+import DA.Time (RelTime, subTime)
+import Config (SystemConfig, fetchParams)
+import Attestations
+  ( AttestationKind(..), AttestationIndex, lookupAttestation, lookupAttestedAt )
+import Movement (MovementIndex, hasOpenMovement)
+import Discrepancy (DiscrepancyIndex, hasOpenDiscrepancy)
+
+data CheckResult = CheckPassed | CheckFailed with reason : Text
+  deriving (Eq, Show)
+
+-- | Compliance check interface — escrow/fund run a list of these as data.
+interface ComplianceCheck where
+  viewtype ComplianceCheckView
+
+  validate : Party -> Decimal -> Update CheckResult
+
+  nonconsuming choice Validate : CheckResult
+    with
+      subject : Party
+      amount : Decimal
+    controller subject
+    do validate this subject amount
+
+data ComplianceCheckView = ComplianceCheckView with
+    name : Text
+    provider : Party
+  deriving (Eq, Show)
+
+checkName : ComplianceCheckView -> Text
+checkName v = v.name
+
+-- 1. KYC
+template KYCCheck
+  with
+    provider : Party
+    subject : Party
+    validUntil : Time
+  where
+    signatory provider
+    observer subject
+
+    interface instance ComplianceCheck for KYCCheck where
+      view = ComplianceCheckView with name = "KYCCheck", provider
+      validate actor _amount = do
+        now <- getTime
+        if actor /= subject then pure (CheckFailed "KYC subject mismatch")
+        else if now > validUntil then pure (CheckFailed "KYC expired")
+        else pure CheckPassed
+
+-- 2. Sanctions
+template SanctionsCheck
+  with
+    provider : Party
+    allowedJurisdictions : [Text]
+    subjectJurisdiction : Text
+    -- | Parties (buyers/investors) that will invoke Validate directly must see this check.
+    observers : [Party]
+  where
+    signatory provider
+    observer observers
+
+    choice UpdateAllowList : ContractId SanctionsCheck
+      with
+        newList : [Text]
+      controller provider
+      do create this with allowedJurisdictions = newList
+
+    interface instance ComplianceCheck for SanctionsCheck where
+      view = ComplianceCheckView with name = "SanctionsCheck", provider
+      validate _actor _amount =
+        if subjectJurisdiction `elem` allowedJurisdictions
+        then pure CheckPassed
+        else pure (CheckFailed ("Jurisdiction not allowed: " <> subjectJurisdiction))
+
+-- 3. Limit
+template LimitCheck
+  with
+    provider : Party
+    maxTransfer : Decimal
+    observers : [Party]
+  where
+    signatory provider
+    observer observers
+
+    interface instance ComplianceCheck for LimitCheck where
+      view = ComplianceCheckView with name = "LimitCheck", provider
+      validate _actor amount =
+        if amount <= maxTransfer then pure CheckPassed
+        else pure (CheckFailed "Amount exceeds transfer limit")
+
+-- 4. Assay freshness
+template AssayFreshnessCheck
+  with
+    provider : Party
+    custodian : Party
+    configCid : ContractId SystemConfig
+    indexCid : ContractId AttestationIndex
+    backingSerials : [Text]
+  where
+    signatory provider
+    observer custodian
+
+    interface instance ComplianceCheck for AssayFreshnessCheck where
+      view = ComplianceCheckView with name = "AssayFreshnessCheck", provider
+      validate _actor _amount = do
+        params <- fetchParams configCid
+        idx <- fetch indexCid
+        now <- getTime
+        results <- mapA (\serial -> checkFresh idx now params.assayValidity serial Purity) backingSerials
+        pure (foldCheck results)
+
+-- 5. Presence freshness
+template PresenceFreshnessCheck
+  with
+    provider : Party
+    custodian : Party
+    configCid : ContractId SystemConfig
+    indexCid : ContractId AttestationIndex
+    backingSerials : [Text]
+  where
+    signatory provider
+    observer custodian
+
+    interface instance ComplianceCheck for PresenceFreshnessCheck where
+      view = ComplianceCheckView with name = "PresenceFreshnessCheck", provider
+      validate _actor _amount = do
+        params <- fetchParams configCid
+        idx <- fetch indexCid
+        now <- getTime
+        results <- mapA (\serial -> checkFresh idx now params.attestationMaxAge serial Presence) backingSerials
+        pure (foldCheck results)
+
+-- 6. Proof of reserve
+template ProofOfReserveCheck
+  with
+    provider : Party
+    custodian : Party
+    configCid : ContractId SystemConfig
+    indexCid : ContractId AttestationIndex
+    backingSerials : [Text]
+  where
+    signatory provider
+    observer custodian
+
+    interface instance ComplianceCheck for ProofOfReserveCheck where
+      view = ComplianceCheckView with name = "ProofOfReserveCheck", provider
+      validate _actor _amount = do
+        params <- fetchParams configCid
+        idx <- fetch indexCid
+        now <- getTime
+        results <- mapA (\serial -> checkFresh idx now params.proofOfReserveMaxAge serial AuditResult) backingSerials
+        pure (foldCheck results)
+
+-- 7. Movement
+template MovementCheck
+  with
+    provider : Party
+    custodian : Party
+    movementIndexCid : ContractId MovementIndex
+    backingSerials : [Text]
+  where
+    signatory provider
+    observer custodian
+
+    interface instance ComplianceCheck for MovementCheck where
+      view = ComplianceCheckView with name = "MovementCheck", provider
+      validate _actor _amount = do
+        idx <- fetch movementIndexCid
+        if hasOpenMovement idx backingSerials
+        then pure (CheckFailed "Open BarMovement for backing serial")
+        else pure CheckPassed
+
+-- 8. No open discrepancy
+template NoOpenDiscrepancyCheck
+  with
+    provider : Party
+    custodian : Party
+    discrepancyIndexCid : ContractId DiscrepancyIndex
+    vaultSite : Text
+  where
+    signatory provider
+    observer custodian
+
+    interface instance ComplianceCheck for NoOpenDiscrepancyCheck where
+      view = ComplianceCheckView with name = "NoOpenDiscrepancyCheck", provider
+      validate _actor _amount = do
+        idx <- fetch discrepancyIndexCid
+        if hasOpenDiscrepancy idx vaultSite
+        then pure (CheckFailed "Open DiscrepancyReport for vault site")
+        else pure CheckPassed
+
+-- Helpers
+checkFresh : AttestationIndex -> Time -> RelTime -> Text -> AttestationKind -> Update CheckResult
+checkFresh idx now maxAge serial kind =
+  case lookupAttestedAt idx serial kind of
+    None -> pure (CheckFailed ("Missing " <> show kind <> " attestation for " <> serial))
+    Some attestedAt ->
+      let age = subTime now attestedAt
+      in if age > maxAge
+         then pure (CheckFailed (show kind <> " attestation stale for " <> serial))
+         else pure CheckPassed
+
+foldCheck : [CheckResult] -> CheckResult
+foldCheck [] = CheckPassed
+foldCheck (CheckFailed r :: _) = CheckFailed r
+foldCheck (CheckPassed :: rest) = foldCheck rest
+
+-- | Run a list of compliance check interface cids; collect failure names.
+runChecks : [ContractId ComplianceCheck] -> Party -> Decimal -> Update [Text]
+runChecks checks subject amount = do
+  results <- mapA (\cid -> do
+    iface <- fetch cid
+    let v = view iface
+    res <- exercise cid Validate with subject, amount
+    pure (v.name, res)) checks
+  pure [name | (name, CheckFailed _) <- results]

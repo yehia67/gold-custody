@@ -1,0 +1,23 @@
+{
+  "name": "gold-custody-connectors",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Off-ledger TypeScript connectors for the gold-custody prototype (nav-publisher, attestation-service, iso20022-adapter).",
+  "workspaces": [
+    "shared",
+    "nav-publisher",
+    "attestation-service",
+    "iso20022-adapter"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace=shared && npm run build --workspace=nav-publisher --workspace=attestation-service --workspace=iso20022-adapter",
+    "pretest": "npm run build --workspace=shared",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}

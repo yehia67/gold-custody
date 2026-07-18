@@ -1,0 +1,119 @@
+module Scripts.TestToken where
+
+import Daml.Script
+import DA.Date (Month(..), date)
+import DA.Time (time, days)
+import Config
+import Token
+import Operators
+import Scripts.Setup
+  ( allocateParties, bootstrapSystem, appoint, registerAndAssay, mintGold
+  , Bootstrap(..), BarSetup(..)
+  )
+
+testOverMintFails = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  assayerRole <- appoint b p.assayer Assayer "Zurich-A" (days 30)
+  bs <- registerAndAssay b assayerRole b.registryCid b.indexCid "BAR-MINT-1" 1000.0 0.999
+  -- Available = 1000.0 * 0.999 = 999.0 grams; requesting 999.01 must fail.
+  submitMustFail p.custodian do
+    exerciseCmd b.mintAuthCid MintGold with
+      receiptCid = bs.receiptCid
+      assayAttCid = bs.assayAttCid
+      indexCid = bs.indexCid
+      ledgerCid = b.ledgerCid
+      owner = p.investor1
+      amountGrams = 999.01
+
+testCumulativeOverMintFails = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  assayerRole <- appoint b p.assayer Assayer "Zurich-A" (days 30)
+  bs <- registerAndAssay b assayerRole b.registryCid b.indexCid "BAR-MINT-2" 1000.0 0.999
+  (_holdingCid, newLedger) <- mintGold b bs b.ledgerCid p.investor1 500.0
+  -- A second mint against the same bar for the remaining ~499.0 grams pushed
+  -- over the 999.0 total (500 + 500 = 1000 > 999) must fail, and must not
+  -- silently succeed against a stale ledger.
+  submitMustFail p.custodian do
+    exerciseCmd b.mintAuthCid MintGold with
+      receiptCid = bs.receiptCid
+      assayAttCid = bs.assayAttCid
+      indexCid = bs.indexCid
+      ledgerCid = newLedger
+      owner = p.investor1
+      amountGrams = 500.0
+  Some ledger <- queryContractId p.custodian newLedger
+  assertMsg "ledger tracks first mint only" (totalMinted ledger == 500.0)
+
+testMintWithoutFreshAssayFails = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  assayerRole <- appoint b p.assayer Assayer "Zurich-A" (days 30)
+  bs <- registerAndAssay b assayerRole b.registryCid b.indexCid "BAR-MINT-3" 1000.0 0.999
+  -- assayValidity default is 30 days; move past it so the attestation is stale.
+  passTime (days 31)
+  submitMustFail p.custodian do
+    exerciseCmd b.mintAuthCid MintGold with
+      receiptCid = bs.receiptCid
+      assayAttCid = bs.assayAttCid
+      indexCid = bs.indexCid
+      ledgerCid = b.ledgerCid
+      owner = p.investor1
+      amountGrams = 100.0
+
+testTransferGoldRoundTrip = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  assayerRole <- appoint b p.assayer Assayer "Zurich-A" (days 30)
+  bs <- registerAndAssay b assayerRole b.registryCid b.indexCid "BAR-MINT-4" 1000.0 0.999
+  (holdingCid, _newLedger) <- mintGold b bs b.ledgerCid p.investor1 250.0
+  toInvestor2 <- submit p.investor1 do
+    exerciseCmd holdingCid TransferGold with newOwner = p.investor2
+  Some midHolding <- queryContractId p.investor2 toInvestor2
+  assertMsg "investor2 holds after first leg" (midHolding.owner == p.investor2)
+  assertMsg "amount unchanged after first leg" (midHolding.amountGrams == 250.0)
+  backToInvestor1 <- submit p.investor2 do
+    exerciseCmd toInvestor2 TransferGold with newOwner = p.investor1
+  Some finalHolding <- queryContractId p.investor1 backToInvestor1
+  assertMsg "investor1 holds after round trip" (finalHolding.owner == p.investor1)
+  assertMsg "amount unchanged after round trip" (finalHolding.amountGrams == 250.0)
+  -- Old owner can no longer act on a holding they no longer own.
+  submitMustFail p.investor2 do
+    exerciseCmd backToInvestor1 TransferGold with newOwner = p.investor2
+
+testBurnReducesIssuanceLedger = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  assayerRole <- appoint b p.assayer Assayer "Zurich-A" (days 30)
+  bs <- registerAndAssay b assayerRole b.registryCid b.indexCid "BAR-MINT-5" 1000.0 0.999
+  (holdingCid, mintedLedger) <- mintGold b bs b.ledgerCid p.investor1 400.0
+  Some afterMint <- queryContractId p.custodian mintedLedger
+  assertMsg "ledger reflects mint" (totalMinted afterMint == 400.0)
+  burnedLedger <- submit p.custodian do
+    exerciseCmd holdingCid BurnGold with ledgerCid = mintedLedger, serial = "BAR-MINT-5"
+  Some afterBurn <- queryContractId p.custodian burnedLedger
+  assertMsg "ledger reflects burn" (totalMinted afterBurn == 0.0)
+  -- The burned holding is gone; the owner can no longer transfer it.
+  submitMustFail p.investor1 do
+    exerciseCmd holdingCid TransferGold with newOwner = p.investor2
+
+testNonCustodianMintFails = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  assayerRole <- appoint b p.assayer Assayer "Zurich-A" (days 30)
+  bs <- registerAndAssay b assayerRole b.registryCid b.indexCid "BAR-MINT-6" 1000.0 0.999
+  submitMustFail p.investor1 do
+    exerciseCmd b.mintAuthCid MintGold with
+      receiptCid = bs.receiptCid
+      assayAttCid = bs.assayAttCid
+      indexCid = bs.indexCid
+      ledgerCid = b.ledgerCid
+      owner = p.investor1
+      amountGrams = 100.0

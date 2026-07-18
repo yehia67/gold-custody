@@ -1,0 +1,226 @@
+module Fund where
+
+import DA.Text qualified as T
+import DA.Time (RelTime, subTime)
+import Config (SystemConfig, fetchParams)
+import Compliance (ComplianceCheck, runChecks)
+import Oracle (NavPoint)
+import Token
+import Splice.Api.Token.HoldingV1 (InstrumentId(..))
+
+-- | Gates policy: max redemption per period, enforced on-ledger via GatesUsage.
+data GatesPolicy = GatesPolicy with
+    maxRedemptionPerPeriod : Decimal
+    periodLength : RelTime
+  deriving (Eq, Show)
+
+template FundShareClass
+  with
+    fundManager : Party
+    registrar : Party
+    shareClass : Text
+    referenceCurrency : Text
+    feeBps : Int
+    gatesPolicy : GatesPolicy
+    configCid : ContractId SystemConfig
+    instrumentId : InstrumentId
+  where
+    signatory fundManager
+    observer registrar
+    ensure feeBps >= 0 && feeBps <= 10000 && T.length shareClass > 0
+
+template GatesUsage
+  with
+    fundManager : Party
+    shareClass : Text
+    periodStart : Time
+    redeemedInPeriod : Decimal
+    policy : GatesPolicy
+  where
+    signatory fundManager
+
+    choice RecordRedemption : ContractId GatesUsage
+      with
+        amount : Decimal
+      controller fundManager
+      do
+        now <- getTime
+        let elapsed = subTime now periodStart
+        if elapsed >= policy.periodLength then
+          -- New period
+          create this with
+            periodStart = now
+            redeemedInPeriod = amount
+        else do
+          let newTotal = redeemedInPeriod + amount
+          assertMsg
+            ("Redemption exceeds gate for period: " <> show newTotal <> " > " <> show policy.maxRedemptionPerPeriod)
+            (newTotal <= policy.maxRedemptionPerPeriod)
+          create this with redeemedInPeriod = newTotal
+
+template FundUnitHolding
+  with
+    fundManager : Party
+    owner : Party
+    shareClass : Text
+    units : Decimal
+    instrumentId : InstrumentId
+  where
+    signatory fundManager
+    observer owner
+    ensure units > 0.0
+
+    choice TransferUnits : ContractId FundUnitHolding
+      with
+        newOwner : Party
+      controller owner
+      do create this with owner = newOwner
+
+    choice BurnUnits : ()
+      controller fundManager
+      do pure ()
+
+-- | Banker's rounding (half-even) to 6 decimal places.
+-- Documented in DECISIONS.md; boundary tested in TestFund.
+bankersRound6 : Decimal -> Decimal
+bankersRound6 x =
+  let scale = 1000000.0
+      scaled = x * scale
+      n = floor scaled
+      floored = intToDecimal n
+      frac = scaled - floored
+      ceiled = floored + 1.0
+  in if frac < 0.5 then floored / scale
+     else if frac > 0.5 then ceiled / scale
+     else if (n % 2) == 0 then floored / scale
+     else ceiled / scale
+
+template SubscriptionRequest
+  with
+    investor : Party
+    fundManager : Party
+    cashIssuer : Party
+    shareClassCid : ContractId FundShareClass
+    cashCid : ContractId CashHolding
+    amount : Decimal
+    requiredChecks : [ContractId ComplianceCheck]
+  where
+    signatory investor
+    observer fundManager, cashIssuer
+
+    -- | cashIssuer must co-authorize: archiving/recreating cashCid needs its
+    -- issuer's authority (see Escrow.daml for the same authorization gap).
+    -- | feeCash is Optional: CashHolding requires amount > 0.0, and a 0%-fee
+    -- share class (or a subscription too small to round to a positive fee)
+    -- legitimately produces a zero fee, which must not attempt to create a
+    -- zero-amount holding.
+    choice SettleSubscription : (ContractId FundUnitHolding, Optional (ContractId CashHolding))
+      with
+        navCid : ContractId NavPoint
+      controller fundManager, cashIssuer
+      do
+        sc <- fetch shareClassCid
+        assertMsg "Fund manager mismatch" (sc.fundManager == fundManager)
+        nav <- fetch navCid
+        now <- getTime
+        assertMsg "NAV share class mismatch" (nav.shareClass == sc.shareClass)
+        assertMsg "NAV stale" (now < nav.validUntil)
+        assertMsg "NAV must be published at or before now" (nav.publishedAt <= now)
+        failures <- runChecks requiredChecks investor amount
+        assertMsg ("Subscription blocked by checks: " <> show failures) (null failures)
+        cash <- fetch cashCid
+        assertMsg "Cash owner must be investor" (cash.owner == investor)
+        assertMsg "Cash amount mismatch" (cash.amount == amount)
+        assertMsg "Cash issuer mismatch" (cash.issuer == cashIssuer)
+        let fee = amount * intToDecimal sc.feeBps / 10000.0
+        let net = amount - fee
+        let rawUnits = net / nav.navPerUnit
+        let units = bankersRound6 rawUnits
+        assertMsg "Units must be positive after fees" (units > 0.0)
+        archive cashCid
+        feeCashOpt <- if fee > 0.0
+          then Some <$> create cash with owner = fundManager, amount = fee
+          else pure None
+        -- Remaining net cash absorbed by fund (archived into fund books — represent as fundManager holding)
+        _fundCash <- if net > 0.0
+          then Some <$> create cash with owner = fundManager, amount = net
+          else pure None
+        unitCid <- create FundUnitHolding with
+          fundManager
+          owner = investor
+          shareClass = sc.shareClass
+          units
+          instrumentId = sc.instrumentId
+        pure (unitCid, feeCashOpt)
+
+template RedemptionRequest
+  with
+    investor : Party
+    fundManager : Party
+    -- | Whichever party's signature the settlement branch below needs:
+    -- the gold issuer (custodian) for in-kind, or the cash issuer for cash-out.
+    -- Archiving/creating GoldHolding needs its issuer's authority, and IssueCash
+    -- is controller-issuer-only — same authorization gap as Escrow.daml.
+    coAuthorizer : Party
+    shareClassCid : ContractId FundShareClass
+    unitCid : ContractId FundUnitHolding
+    gatesUsageCid : ContractId GatesUsage
+    requiredChecks : [ContractId ComplianceCheck]
+    inKind : Bool
+    cashIssuerRoleCid : Optional (ContractId CashIssuerRole)
+    goldSourceCid : Optional (ContractId GoldHolding)
+    goldLedgerCid : Optional (ContractId IssuanceLedger)
+  where
+    signatory investor
+    observer fundManager, coAuthorizer
+
+    choice SettleRedemption : (ContractId GatesUsage, Optional (ContractId CashHolding), Optional (ContractId GoldHolding))
+      with
+        navCid : ContractId NavPoint
+      controller fundManager, coAuthorizer
+      do
+        sc <- fetch shareClassCid
+        unitsH <- fetch unitCid
+        assertMsg "Unit owner must be investor" (unitsH.owner == investor)
+        assertMsg "Share class mismatch" (unitsH.shareClass == sc.shareClass)
+        nav <- fetch navCid
+        now <- getTime
+        assertMsg "NAV stale" (now < nav.validUntil)
+        assertMsg "NAV share class mismatch" (nav.shareClass == sc.shareClass)
+        let gross = unitsH.units * nav.navPerUnit
+        let fee = gross * intToDecimal sc.feeBps / 10000.0
+        let net = gross - fee
+        failures <- runChecks requiredChecks investor net
+        assertMsg ("Redemption blocked by checks: " <> show failures) (null failures)
+        newGates <- exercise gatesUsageCid RecordRedemption with amount = net
+        archive unitCid
+        params <- fetchParams sc.configCid
+        if inKind then do
+          assertMsg "In-kind requires amount above threshold" (net >= params.inKindRedemptionThresholdGrams)
+          goldCid <- optionalAbort "goldSourceCid required for in-kind" goldSourceCid
+          gold <- fetch goldCid
+          assertMsg "Gold must be owned by fund manager" (gold.owner == fundManager)
+          assertMsg "Gold issuer must match coAuthorizer" (gold.issuer == coAuthorizer)
+          assertMsg "Gold amount must cover in-kind" (gold.amountGrams >= net)
+          archive goldCid
+          transferred <- create gold with owner = investor, amountGrams = net
+          -- leave change with fund if any
+          if gold.amountGrams > net then do
+            _ <- create gold with owner = fundManager, amountGrams = gold.amountGrams - net
+            pure ()
+          else pure ()
+          pure (newGates, None, Some transferred)
+        else do
+          issuerRoleCid <- optionalAbort "cashIssuerRoleCid required for cash redemption" cashIssuerRoleCid
+          issuerRole <- fetch issuerRoleCid
+          assertMsg "CashIssuerRole issuer must match coAuthorizer" (issuerRole.issuer == coAuthorizer)
+          cashCid <- exercise issuerRoleCid IssueCash with
+            owner = investor
+            amount = net
+            currencyId = sc.referenceCurrency
+          -- Fee retained conceptually by not issuing it to investor
+          pure (newGates, Some cashCid, None)
+
+optionalAbort : Text -> Optional a -> Update a
+optionalAbort msg None = abort msg
+optionalAbort _ (Some x) = pure x

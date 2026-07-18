@@ -1,0 +1,83 @@
+module Scripts.TestVault where
+
+import Daml.Script
+import DA.Date (Month(..), date)
+import DA.Time (time)
+import Config
+import Vault
+import Operators
+import Scripts.Setup (allocateParties, bootstrapSystem, Bootstrap(..))
+
+testRegisterBarHappy = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  (barCid, _newReg, receiptCid) <- submit p.custodian do
+    exerciseCmd b.custodianRoleCid RegisterBar with
+      registryCid = b.registryCid
+      serialNumber = "BAR-001"
+      weightGrams = 1000.0
+      purity = 0.999
+      vaultLocation = "Zurich-A"
+      custodianRef = "REF-1"
+  Some bar <- queryContractId p.custodian barCid
+  assertMsg "Serial set" (bar.serialNumber == "BAR-001")
+  Some receipt <- queryContractId p.custodian receiptCid
+  assertMsg "Receipt serial" (receipt.serialNumber == "BAR-001")
+
+testDuplicateSerialFails = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  (_, newReg, _) <- submit p.custodian do
+    exerciseCmd b.custodianRoleCid RegisterBar with
+      registryCid = b.registryCid
+      serialNumber = "BAR-FIRST"
+      weightGrams = 1000.0
+      purity = 0.999
+      vaultLocation = "Zurich-A"
+      custodianRef = "REF-1"
+  -- Second bar with a fresh serial succeeds when threading the updated registry cid.
+  _ <- submit p.custodian do
+    exerciseCmd b.custodianRoleCid RegisterBar with
+      registryCid = newReg
+      serialNumber = "BAR-SECOND"
+      weightGrams = 500.0
+      purity = 0.999
+      vaultLocation = "Zurich-A"
+      custodianRef = "REF-2"
+  -- Re-registering the already-used serial (even with the latest registry cid) fails.
+  submitMustFail p.custodian do
+    exerciseCmd b.custodianRoleCid RegisterBar with
+      registryCid = newReg
+      serialNumber = "BAR-FIRST"
+      weightGrams = 1000.0
+      purity = 0.999
+      vaultLocation = "Zurich-A"
+      custodianRef = "REF-1"
+
+testSubThresholdPurityFails = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  submitMustFail p.custodian do
+    exerciseCmd b.custodianRoleCid RegisterBar with
+      registryCid = b.registryCid
+      serialNumber = "BAR-LOW"
+      weightGrams = 1000.0
+      purity = 0.90
+      vaultLocation = "Zurich-A"
+      custodianRef = "REF-1"
+
+testNonCustodianCannotRegister = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  submitMustFail p.investor1 do
+    exerciseCmd b.custodianRoleCid RegisterBar with
+      registryCid = b.registryCid
+      serialNumber = "BAR-X"
+      weightGrams = 1000.0
+      purity = 0.999
+      vaultLocation = "Zurich-A"
+      custodianRef = "REF-1"

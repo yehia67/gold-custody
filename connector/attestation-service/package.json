@@ -1,0 +1,19 @@
+{
+  "name": "@gold-custody/attestation-service",
+  "version": "0.1.0",
+  "private": true,
+  "description": "HTTP service that validates and co-signs custodian attestations, hashes evidence into an evidence store, and submits them to the ledger.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@gold-custody/shared": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "typescript": "^7.0.2"
+  }
+}

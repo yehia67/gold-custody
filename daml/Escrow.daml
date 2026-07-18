@@ -1,0 +1,110 @@
+module Escrow where
+
+import Config (SystemConfig, fetchParams)
+import Compliance (ComplianceCheck, runChecks)
+import Token (GoldHolding, CashHolding)
+import DA.Time (RelTime, addRelTime)
+
+-- | Seller proposes an escrow for a gold holding against cash.
+-- NOTE on authorization: Daml authority does not propagate transitively (only
+-- actors-of-the-exercise + signatories-of-the-exercised-contract flow to
+-- consequences). Archiving/recreating a CashHolding requires its issuer's
+-- authority, so cashIssuer must be an explicit joint controller wherever a
+-- CashHolding is consumed here — it cannot be obtained merely by adding
+-- cashIssuer to a submit's actAs.
+template EscrowProposal
+  with
+    seller : Party
+    buyer : Party
+    goldCid : ContractId GoldHolding
+    cashAmount : Decimal
+    cashIssuer : Party
+    requiredChecks : [ContractId ComplianceCheck]
+    configCid : ContractId SystemConfig
+    expiryOverride : Optional RelTime
+  where
+    signatory seller
+    observer buyer, cashIssuer
+
+    choice AcceptAndFund : ContractId GoldEscrow
+      with
+        cashHoldingCid : ContractId CashHolding
+      controller buyer, cashIssuer
+      do
+        gold <- fetch goldCid
+        assertMsg "Gold must be owned by seller" (gold.owner == seller)
+        cash <- fetch cashHoldingCid
+        assertMsg "Cash must be owned by buyer" (cash.owner == buyer)
+        assertMsg "Cash amount mismatch" (cash.amount == cashAmount)
+        assertMsg "Cash issuer mismatch" (cash.issuer == cashIssuer)
+        params <- fetchParams configCid
+        now <- getTime
+        let expiryRel = case expiryOverride of
+              Some r -> r
+              None -> params.escrowDefaultExpiry
+        -- Lock by transferring both holdings to escrow (re-create under escrow parties).
+        -- Archive inputs by consuming via transfer-to-escrow pattern:
+        archive goldCid
+        archive cashHoldingCid
+        lockedGold <- create gold with owner = seller -- still seller-signed; escrow tracks cid
+        lockedCash <- create cash with owner = buyer
+        create GoldEscrow with
+          seller
+          buyer
+          goldCid = lockedGold
+          cashCid = lockedCash
+          cashAmount
+          cashIssuer
+          requiredChecks
+          configCid
+          expiresAt = addRelTime now expiryRel
+
+template GoldEscrow
+  with
+    seller : Party
+    buyer : Party
+    goldCid : ContractId GoldHolding
+    cashCid : ContractId CashHolding
+    cashAmount : Decimal
+    cashIssuer : Party
+    requiredChecks : [ContractId ComplianceCheck]
+    configCid : ContractId SystemConfig
+    expiresAt : Time
+  where
+    signatory seller, buyer
+    observer cashIssuer
+
+    choice ReconfigureChecks : ContractId GoldEscrow
+      with
+        newChecks : [ContractId ComplianceCheck]
+      controller seller, buyer
+      do
+        create this with requiredChecks = newChecks
+
+    choice Settle : (ContractId GoldHolding, ContractId CashHolding)
+      controller buyer, cashIssuer
+      do
+        now <- getTime
+        assertMsg "Escrow expired" (now < expiresAt)
+        failures <- runChecks requiredChecks buyer cashAmount
+        assertMsg ("Settlement blocked by checks: " <> show failures) (null failures)
+        gold <- fetch goldCid
+        cash <- fetch cashCid
+        archive goldCid
+        archive cashCid
+        newGold <- create gold with owner = buyer
+        newCash <- create cash with owner = seller
+        pure (newGold, newCash)
+
+    choice Cancel : (ContractId GoldHolding, ContractId CashHolding)
+      controller seller, cashIssuer
+      do
+        now <- getTime
+        assertMsg "Cancel only after expiry" (now >= expiresAt)
+        gold <- fetch goldCid
+        cash <- fetch cashCid
+        archive goldCid
+        archive cashCid
+        newGold <- create gold with owner = seller
+        newCash <- create cash with owner = buyer
+        pure (newGold, newCash)

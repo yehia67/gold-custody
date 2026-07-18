@@ -1,0 +1,18 @@
+{
+  "name": "@gold-custody/shared",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Config loader, shared types, and mock ledger client for the gold-custody connectors.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "typescript": "^7.0.2"
+  }
+}

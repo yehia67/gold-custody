@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Runtime artifacts written by the connectors when run locally.
+evidence-store/
+iso20022-adapter/inbox/*
+!iso20022-adapter/inbox/.gitkeep
+iso20022-adapter/inbox/processed/
+iso20022-adapter/outbox/*
+!iso20022-adapter/outbox/.gitkeep

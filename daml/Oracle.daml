@@ -1,0 +1,238 @@
+module Oracle where
+
+import DA.Text qualified as T
+import Config (SystemConfig, fetchParams)
+import Operators (OperatorRole, OperatorType(..), Permission(PublishOracle, PublishNav))
+import DA.Time (addRelTime)
+
+data PriceSource = PriceSource with
+    name : Text
+    hash : Text
+  deriving (Eq, Show)
+
+template PricePoint
+  with
+    publisher : Party
+    value : Decimal
+    sources : [PriceSource]
+    publishedAt : Time
+    validUntil : Time
+    -- | Parties (custodian, fund consumers, etc.) needing visibility to fetch this.
+    observers : [Party]
+  where
+    signatory publisher
+    observer observers
+    ensure value > 0.0 && length sources > 0
+
+template NavPoint
+  with
+    publisher : Party
+    shareClass : Text
+    navPerUnit : Decimal
+    xauReference : Decimal
+    calcMethodHash : Text
+    publishedAt : Time
+    validUntil : Time
+    -- | Parties (custodian, fund manager, registrar, etc.) needing visibility to fetch this.
+    observers : [Party]
+  where
+    signatory publisher
+    observer observers
+    ensure navPerUnit > 0.0 && T.length calcMethodHash > 0
+
+-- | Latest unexpired price tracker for divergence checks (keyless).
+template PriceIndex
+  with
+    custodian : Party
+    latestCid : Optional (ContractId PricePoint)
+  where
+    signatory custodian
+
+    choice SetLatestPrice : ContractId PriceIndex
+      with
+        cid : ContractId PricePoint
+      controller custodian
+      do create this with latestCid = Some cid
+
+-- | Two-step propose/confirm when divergence exceeds maxOracleDivergenceBps.
+template DivergentPriceProposal
+  with
+    proposer : Party
+    confirmer : Party
+    custodian : Party
+    value : Decimal
+    sources : [PriceSource]
+    configCid : ContractId SystemConfig
+    previousCid : ContractId PricePoint
+    priceIndexCid : ContractId PriceIndex
+  where
+    signatory proposer
+    observer confirmer, custodian
+
+    -- | custodian must co-authorize: SetLatestPrice below is controller custodian.
+    choice ConfirmDivergentPrice : (ContractId PricePoint, ContractId PriceIndex)
+      with
+        observers : [Party]
+      controller confirmer, custodian
+      do
+        assertMsg "Confirmer must differ from proposer" (confirmer /= proposer)
+        params <- fetchParams configCid
+        now <- getTime
+        pp <- create PricePoint with
+          publisher = proposer
+          value
+          sources
+          publishedAt = now
+          validUntil = addRelTime now params.navValidity
+          observers
+        -- Note: price validity uses navValidity window from config for XAU points
+        -- as published validity window; documented in DECISIONS if distinct needed.
+        newIdx <- exercise priceIndexCid SetLatestPrice with cid = pp
+        pure (pp, newIdx)
+
+template OraclePublishAuthority
+  with
+    custodian : Party
+    configCid : ContractId SystemConfig
+    priceIndexCid : ContractId PriceIndex
+  where
+    signatory custodian
+
+    -- | priceIndexCid is a choice parameter (not read off `this`) since every
+    -- successful publish archives the previous PriceIndex cid via SetLatestPrice;
+    -- callers must thread the latest one across successive calls.
+    nonconsuming choice PublishPrice : (ContractId PricePoint, ContractId PriceIndex)
+      with
+        roleCid : ContractId OperatorRole
+        operator : Party
+        priceIndexCid : ContractId PriceIndex
+        value : Decimal
+        sources : [PriceSource]
+        observers : [Party]
+      controller custodian, operator
+      do
+        role <- fetch roleCid
+        assertMsg "roleCid operator mismatch" (role.operator == operator)
+        assertMsg "Must be OracleOperator" (role.role == OracleOperator)
+        assertMsg "Must have PublishOracle permission" (PublishOracle `elem` role.permissions)
+        now <- getTime
+        assertMsg "Role expired" (now <= role.validUntil)
+        params <- fetchParams configCid
+        idx <- fetch priceIndexCid
+        case idx.latestCid of
+          None -> do
+            pp <- create PricePoint with
+              publisher = role.operator
+              value
+              sources
+              publishedAt = now
+              validUntil = addRelTime now params.navValidity
+              observers
+            newIdx <- exercise priceIndexCid SetLatestPrice with cid = pp
+            pure (pp, newIdx)
+          Some prevCid -> do
+            prev <- fetch prevCid
+            if now > prev.validUntil then do
+              pp <- create PricePoint with
+                publisher = role.operator
+                value
+                sources
+                publishedAt = now
+                validUntil = addRelTime now params.navValidity
+                observers
+              newIdx <- exercise priceIndexCid SetLatestPrice with cid = pp
+              pure (pp, newIdx)
+            else do
+              let bps = divergenceBps prev.value value
+              assertMsg
+                ("Divergence " <> show bps <> " bps exceeds max; use ProposeDivergentPrice")
+                (bps <= params.maxOracleDivergenceBps)
+              pp <- create PricePoint with
+                publisher = role.operator
+                value
+                sources
+                publishedAt = now
+                validUntil = addRelTime now params.navValidity
+                observers
+              newIdx <- exercise priceIndexCid SetLatestPrice with cid = pp
+              pure (pp, newIdx)
+
+    -- | operator must co-authorize since the created DivergentPriceProposal is signed by them.
+    -- priceIndexCid is a choice parameter for the same reason as in PublishPrice.
+    nonconsuming choice ProposeDivergentPrice : ContractId DivergentPriceProposal
+      with
+        roleCid : ContractId OperatorRole
+        operator : Party
+        priceIndexCid : ContractId PriceIndex
+        confirmer : Party
+        value : Decimal
+        sources : [PriceSource]
+      controller custodian, operator
+      do
+        role <- fetch roleCid
+        assertMsg "roleCid operator mismatch" (role.operator == operator)
+        assertMsg "Must be OracleOperator" (role.role == OracleOperator)
+        idx <- fetch priceIndexCid
+        prevCid <- case idx.latestCid of
+          Some c -> pure c
+          None -> abort "No previous price for divergent propose"
+        prev <- fetch prevCid
+        params <- fetchParams configCid
+        let bps = divergenceBps prev.value value
+        assertMsg "Divergence does not exceed threshold" (bps > params.maxOracleDivergenceBps)
+        create DivergentPriceProposal with
+          proposer = role.operator
+          confirmer
+          custodian
+          value
+          sources
+          configCid
+          previousCid = prevCid
+          priceIndexCid
+
+template NavPublishAuthority
+  with
+    custodian : Party
+    configCid : ContractId SystemConfig
+  where
+    signatory custodian
+
+    -- | operator must co-authorize since the created NavPoint is signed by them.
+    nonconsuming choice PublishNavPoint : ContractId NavPoint
+      with
+        roleCid : ContractId OperatorRole
+        operator : Party
+        shareClass : Text
+        navPerUnit : Decimal
+        xauReference : Decimal
+        calcMethodHash : Text
+        observers : [Party]
+      controller custodian, operator
+      do
+        role <- fetch roleCid
+        assertMsg "roleCid operator mismatch" (role.operator == operator)
+        assertMsg "Must be NavAgent" (role.role == NavAgent)
+        assertMsg "Must have PublishNav permission" (PublishNav `elem` role.permissions)
+        now <- getTime
+        assertMsg "Role expired" (now <= role.validUntil)
+        params <- fetchParams configCid
+        create NavPoint with
+          publisher = role.operator
+          shareClass
+          navPerUnit
+          xauReference
+          calcMethodHash
+          publishedAt = now
+          validUntil = addRelTime now params.navValidity
+          observers
+
+-- | Absolute divergence in basis points: |a-b|/a * 10000
+divergenceBps : Decimal -> Decimal -> Int
+divergenceBps old new =
+  let diff = if new >= old then new - old else old - new
+      ratio = diff / old
+      bps = ratio * 10000.0
+  in intPart bps
+
+intPart : Decimal -> Int
+intPart d = floor d
