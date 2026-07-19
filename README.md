@@ -1,4 +1,4 @@
-# Gold Custody — Canton Tokenized Gold, Escrow & Fund Settlement
+# Gold Custody Canton Tokenized Gold, Escrow & Fund Settlement
 
 Production-grade prototype of tokenized gold custody, dual-signature attestations, compliance-gated escrow, and fund subscription/redemption on the Canton Network (Daml + CIP-56), with TypeScript off-ledger connectors.
 
