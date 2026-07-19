@@ -77,7 +77,7 @@ template FundUnitHolding
       do create this with owner = newOwner
 
     choice BurnUnits : ()
-      controller fundManager
+      controller fundManager, owner
       do pure ()
 
 -- | Banker's rounding (half-even) to 6 decimal places.

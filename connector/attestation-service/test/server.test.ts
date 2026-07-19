@@ -33,10 +33,10 @@ describe("attestation-service HTTP server", () => {
     rmSync(evidenceStoreDir, { recursive: true, force: true });
   });
 
-  async function post(body: unknown) {
+  async function post(body: unknown, headers: Record<string, string> = {}) {
     const res = await fetch(`${baseUrl}/attestations`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "x-api-key": "test-api-key", ...headers },
       body: JSON.stringify(body),
     });
     return { status: res.status, body: (await res.json()) as Record<string, unknown> };
@@ -158,5 +158,125 @@ describe("attestation-service HTTP server", () => {
 
     expect(status).toBe(400);
     expect(body.code).toBe("UNKNOWN_OPERATOR");
+  });
+
+  it("allows /healthz without an API key", async () => {
+    const res = await fetch(`${baseUrl}/healthz`);
+    expect(res.status).toBe(200);
+  });
+
+  it("rejects a request with no X-API-Key header", async () => {
+    const res = await fetch(`${baseUrl}/attestations`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ kind: "Purity", barSerial: "BAR-1", operatorId: "Assayer", evidence: base64("x") }),
+    });
+    const body = (await res.json()) as Record<string, unknown>;
+
+    expect(res.status).toBe(401);
+    expect(body.code).toBe("UNAUTHORIZED");
+    expect(ledgerClient.submittedAttestations).toHaveLength(0);
+  });
+
+  it("rejects a request with the wrong X-API-Key value", async () => {
+    const { status, body } = await post(
+      { kind: "Purity", barSerial: "BAR-1", operatorId: "Assayer", evidence: base64("x") },
+      { "x-api-key": "wrong-key" },
+    );
+
+    expect(status).toBe(401);
+    expect(body.code).toBe("UNAUTHORIZED");
+    expect(ledgerClient.submittedAttestations).toHaveLength(0);
+  });
+
+  it("rejects a raw body larger than the size cap with 413", async () => {
+    const res = await fetch(`${baseUrl}/attestations`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": "test-api-key" },
+      body: JSON.stringify({
+        kind: "Purity",
+        barSerial: "BAR-1",
+        operatorId: "Assayer",
+        evidence: base64("x".repeat(2_000_000)),
+      }),
+    });
+    const body = (await res.json()) as Record<string, unknown>;
+
+    expect(res.status).toBe(413);
+    expect(body.code).toBe("PAYLOAD_TOO_LARGE");
+    expect(ledgerClient.submittedAttestations).toHaveLength(0);
+  });
+
+  it("rejects decoded evidence larger than the 512KB cap with 413", async () => {
+    const { status, body } = await post({
+      kind: "Purity",
+      barSerial: "BAR-1",
+      operatorId: "Assayer",
+      evidence: base64("y".repeat(600_000)),
+    });
+
+    expect(status).toBe(413);
+    expect(body.code).toBe("EVIDENCE_TOO_LARGE");
+    expect(ledgerClient.submittedAttestations).toHaveLength(0);
+  });
+
+  it("rejects evidence containing invalid base64 characters", async () => {
+    const { status, body } = await post({
+      kind: "Purity",
+      barSerial: "BAR-1",
+      operatorId: "Assayer",
+      evidence: "not-valid-base64!!!",
+    });
+
+    expect(status).toBe(400);
+    expect(body.code).toBe("SCHEMA_VIOLATION");
+    expect(ledgerClient.submittedAttestations).toHaveLength(0);
+  });
+
+  it("rejects base64 evidence with a length that is not a multiple of 4", async () => {
+    const { status, body } = await post({
+      kind: "Purity",
+      barSerial: "BAR-1",
+      operatorId: "Assayer",
+      evidence: "abcde",
+    });
+
+    expect(status).toBe(400);
+    expect(body.code).toBe("SCHEMA_VIOLATION");
+  });
+
+  it("rejects a conflicting second half for the same role with a different evidenceHash", async () => {
+    const first = await post({
+      kind: "Weight",
+      barSerial: "BAR-4",
+      operatorId: "Weighmaster",
+      evidence: base64("human reading: 1000.00g"),
+    });
+    expect(first.status).toBe(202);
+
+    const conflicting = await post({
+      kind: "Weight",
+      barSerial: "BAR-4",
+      operatorId: "Weighmaster",
+      evidence: base64("human reading: 999.00g (different!)"),
+    });
+
+    expect(conflicting.status).toBe(409);
+    expect(conflicting.body.code).toBe("COSIGN_CONFLICT");
+    expect(ledgerClient.submittedAttestations).toHaveLength(0);
+  });
+
+  it("allows the same role to idempotently resubmit identical evidence without conflict", async () => {
+    const payload = {
+      kind: "Weight",
+      barSerial: "BAR-5",
+      operatorId: "Weighmaster",
+      evidence: base64("human reading: 1000.00g"),
+    };
+    const first = await post(payload);
+    const second = await post(payload);
+
+    expect(first.status).toBe(202);
+    expect(second.status).toBe(202);
   });
 });

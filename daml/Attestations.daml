@@ -32,6 +32,17 @@ kindOf (MovementPayload _ _) = Movement
 kindOf (AuditResultPayload _ _) = AuditResult
 kindOf (InsurancePayload _ _) = InsuranceStatus
 
+-- | Whether an attestation's own payload semantically "passes" — distinct
+-- from freshness (age). Presence must report present; AuditResult must
+-- report passed. Other kinds carry no pass/fail semantics of their own.
+semanticOkOf : AttestationPayload -> Bool
+semanticOkOf (PresencePayload present) = present
+semanticOkOf (AuditResultPayload _ passed) = passed
+semanticOkOf (WeightPayload _) = True
+semanticOkOf (PurityPayload _) = True
+semanticOkOf (MovementPayload _ _) = True
+semanticOkOf (InsurancePayload _ _) = True
+
 template Attestation
   with
     attestor : Party
@@ -62,7 +73,13 @@ template AttestationIndex
     -- the individual Attestation contract — whose stakeholders (attestor,
     -- custodian) are usually disjoint from a check's own authorizing parties
     -- (compliance provider, subject), which would otherwise fail authorization.
-    entries : [(Text, AttestationKind, ContractId Attestation, Time)]
+    -- | (serial, kind, cid, attestedAt, semanticOk). semanticOk is computed
+    -- from the fetched Attestation's own payload (semanticOkOf) at upsert
+    -- time, not trusted from the caller, so freshness checks (checkFresh)
+    -- can reject e.g. a Presence attestation that says "not present" or an
+    -- AuditResult that says "did not pass" purely from this broadly-observed
+    -- index, without re-fetching the Attestation contract.
+    entries : [(Text, AttestationKind, ContractId Attestation, Time, Bool)]
     -- | Parties (operators, checks) needing visibility to fetch/exercise this index.
     observers : [Party]
   where
@@ -77,20 +94,32 @@ template AttestationIndex
         attestedAt : Time
       controller custodian
       do
-        let filtered = filter (\(s, k, _, _) -> not (s == serial && k == kind)) entries
-        create this with entries = (serial, kind, attCid, attestedAt) :: filtered
+        att <- fetch attCid
+        assertMsg "attestedAt mismatch" (att.attestedAt == attestedAt)
+        assertMsg "barSerial mismatch" (att.barSerial == serial)
+        assertMsg "kind mismatch" (att.kind == kind)
+        let semanticOk = semanticOkOf att.payload
+        let filtered = filter (\(s, k, _, _, _) -> not (s == serial && k == kind)) entries
+        create this with entries = (serial, kind, attCid, attestedAt, semanticOk) :: filtered
 
 -- | Lookup latest attestation cid for a serial+kind, if any.
 lookupAttestation : AttestationIndex -> Text -> AttestationKind -> Optional (ContractId Attestation)
 lookupAttestation idx serial kind =
-  case filter (\(s, k, _, _) -> s == serial && k == kind) idx.entries of
-    ((_, _, cid, _) :: _) -> Some cid
+  case filter (\(s, k, _, _, _) -> s == serial && k == kind) idx.entries of
+    ((_, _, cid, _, _) :: _) -> Some cid
     [] -> None
 
 -- | Lookup latest attestedAt time for a serial+kind, if any — used by
 -- freshness checks so they don't need to fetch the Attestation itself.
 lookupAttestedAt : AttestationIndex -> Text -> AttestationKind -> Optional Time
 lookupAttestedAt idx serial kind =
-  case filter (\(s, k, _, _) -> s == serial && k == kind) idx.entries of
-    ((_, _, _, t) :: _) -> Some t
+  case filter (\(s, k, _, _, _) -> s == serial && k == kind) idx.entries of
+    ((_, _, _, t, _) :: _) -> Some t
+    [] -> None
+
+-- | Lookup the payload's own semantic pass/fail flag for a serial+kind, if any.
+lookupSemanticOk : AttestationIndex -> Text -> AttestationKind -> Optional Bool
+lookupSemanticOk idx serial kind =
+  case filter (\(s, k, _, _, _) -> s == serial && k == kind) idx.entries of
+    ((_, _, _, _, ok) :: _) -> Some ok
     [] -> None

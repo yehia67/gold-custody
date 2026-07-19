@@ -8,12 +8,12 @@ SDK: Daml 3.5.2 via DPM 1.0.21
 | Gate | Result |
 |------|--------|
 | `dpm build` | PASS (warnings explained in DECISIONS.md; upgrade-interfaces / daml-script co-location silenced) |
-| `dpm test` | PASS — **50/50** scripts |
+| `dpm test` | PASS — **55/55** scripts (post quality-fix pass) |
+| Connector `npm test` | PASS — **80** passed, 1 skipped (LocalNet) |
 | Hard-rule grep `TODO\|FIXME\|not implemented\|XXX\|HACK` in `daml/` | PASS — empty |
 | Hard-rule grep placeholders in `daml/` for `undefined` | PASS — empty in Daml |
 | TypeScript `undefined` | Documented in DECISIONS.md as optional-typing idiom (not stubs) |
 | Magic-literal scan | Hits only in test fixtures (`TestEscrow` 3600s expiry, `TestCompliance` LimitCheck 100000) — documented |
-| `npm test` (connectors) | PASS — 34 passed, 1 skipped (LocalNet); 35 with `LOCALNET=1` |
 | `make demo` / `scripts/demo.sh` | PASS — genesisToRedemption + selfFreezingToken |
 | README | Present with prereqs, setup, tests, demo, diagram |
 

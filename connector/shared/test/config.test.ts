@@ -30,6 +30,7 @@ ledger:
   grpcHost: localhost
   grpcPort: 6865
   cnQuickstartPath: ../cn-quickstart
+  mode: mock
 
 business:
   minPurity: "0.995"
@@ -49,6 +50,7 @@ business:
 connectors:
   navPublisher:
     port: 8101
+    host: 127.0.0.1
     xauSources:
       - type: fixture
         name: fixture-primary
@@ -58,7 +60,10 @@ connectors:
         path: ./connector/nav-publisher/fixtures/xau.json
   attestationService:
     port: 8102
+    host: 127.0.0.1
     evidenceStore: ./evidence-store
+    apiKey: local-dev-key
+    weightCosignTtlSeconds: 3600
   iso20022:
     inboxDir: ./connector/iso20022-adapter/inbox
     outboxDir: ./connector/iso20022-adapter/outbox
@@ -93,7 +98,27 @@ describe("loadConfig", () => {
       value: "2650.00",
     });
     expect(config.connectors.attestationService.port).toBe(8102);
+    expect(config.connectors.attestationService.apiKey).toBe("local-dev-key");
+    expect(config.connectors.attestationService.weightCosignTtlSeconds).toBe(3600);
+    expect(config.connectors.navPublisher.host).toBe("127.0.0.1");
+    expect(config.ledger.mode).toBe("mock");
     expect(config.connectors.iso20022.inboxDir).toBe("./connector/iso20022-adapter/inbox");
+  });
+
+  it("defaults host, ledger.mode, and weightCosignTtlSeconds when omitted", () => {
+    const path = join(dir, "localnet.yaml");
+    const yamlWithoutDefaults = VALID_YAML.replace("host: 127.0.0.1\n    xauSources:", "xauSources:")
+      .replace("    host: 127.0.0.1\n    evidenceStore:", "    evidenceStore:")
+      .replace("    weightCosignTtlSeconds: 3600\n", "")
+      .replace("  mode: mock\n", "");
+    writeFileSync(path, yamlWithoutDefaults, "utf8");
+
+    const config = loadConfig(path);
+
+    expect(config.ledger.mode).toBe("mock");
+    expect(config.connectors.navPublisher.host).toBe("127.0.0.1");
+    expect(config.connectors.attestationService.host).toBe("127.0.0.1");
+    expect(config.connectors.attestationService.weightCosignTtlSeconds).toBe(3600);
   });
 
   it("resolves config-relative paths against the repo root", () => {
@@ -112,7 +137,7 @@ describe("loadConfig", () => {
     const path = join(dir, "localnet.yaml");
     writeFileSync(path, "parties:\n  custodian: Custodian\n", "utf8");
 
-    expect(() => loadConfig(path)).toThrow(/missing required section "ledger"/);
+    expect(() => loadConfig(path)).toThrow(/ledger/);
   });
 
   it("throws when navPublisher.xauSources is not an array", () => {
@@ -123,6 +148,55 @@ describe("loadConfig", () => {
     const path = join(dir, "localnet.yaml");
     writeFileSync(path, badYaml, "utf8");
 
-    expect(() => loadConfig(path)).toThrow(/missing required array "xauSources"/);
+    expect(() => loadConfig(path)).toThrow(/xauSources/);
+  });
+
+  it("rejects a non-numeric port via zod validation", () => {
+    const badYaml = VALID_YAML.replace("port: 8101", 'port: "not-a-port"');
+    const path = join(dir, "localnet.yaml");
+    writeFileSync(path, badYaml, "utf8");
+
+    expect(() => loadConfig(path)).toThrow(/Invalid config/);
+    expect(() => loadConfig(path)).toThrow(/port/);
+  });
+
+  it("rejects a port outside the valid 1-65535 range", () => {
+    const badYaml = VALID_YAML.replace("port: 8102", "port: 70000");
+    const path = join(dir, "localnet.yaml");
+    writeFileSync(path, badYaml, "utf8");
+
+    expect(() => loadConfig(path)).toThrow(/port/);
+  });
+
+  it("rejects a config missing attestationService.apiKey", () => {
+    const badYaml = VALID_YAML.replace("    apiKey: local-dev-key\n", "");
+    const path = join(dir, "localnet.yaml");
+    writeFileSync(path, badYaml, "utf8");
+
+    expect(() => loadConfig(path)).toThrow(/apiKey/);
+  });
+
+  it("rejects an empty party string", () => {
+    const badYaml = VALID_YAML.replace("custodian: Custodian", 'custodian: ""');
+    const path = join(dir, "localnet.yaml");
+    writeFileSync(path, badYaml, "utf8");
+
+    expect(() => loadConfig(path)).toThrow(/parties.custodian/);
+  });
+
+  it("rejects an unrecognized ledger.mode value", () => {
+    const badYaml = VALID_YAML.replace("mode: mock", "mode: bogus");
+    const path = join(dir, "localnet.yaml");
+    writeFileSync(path, badYaml, "utf8");
+
+    expect(() => loadConfig(path)).toThrow(/mode/);
+  });
+
+  it("rejects an xauSources fixture entry missing its value field", () => {
+    const badYaml = VALID_YAML.replace('        value: "2650.00"\n', "");
+    const path = join(dir, "localnet.yaml");
+    writeFileSync(path, badYaml, "utf8");
+
+    expect(() => loadConfig(path)).toThrow(/xauSources/);
   });
 });

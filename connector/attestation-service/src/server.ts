@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { GoldCustodyConfig, LedgerClient } from "@gold-custody/shared";
 import { AttestationValidationError, allowedOperatorsByKind, validateAttestationSubmission } from "./schema";
-import { WeightCoSignTracker, type AttestationHalf } from "./coSign";
+import { CoSignConflictError, WeightCoSignTracker, type AttestationHalf } from "./coSign";
 import { storeEvidence } from "./evidenceStore";
 
 export interface AttestationServiceDeps {
@@ -15,10 +15,30 @@ interface JsonResponse {
   body: Record<string, unknown>;
 }
 
-async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+/** Raw HTTP body above this size is rejected with 413 before JSON parsing is even attempted. */
+const MAX_RAW_BODY_BYTES = 1_000_000;
+
+class PayloadTooLargeError extends Error {}
+
+async function readJsonBody(req: IncomingMessage, maxBytes: number): Promise<unknown> {
   const chunks: Buffer[] = [];
+  let total = 0;
+  let overLimit = false;
+  // Keep draining the stream to completion even once the cap is exceeded
+  // (dropping further bytes instead of buffering them) rather than
+  // abandoning the read early: responding before the client finishes
+  // writing its request body causes ECONNRESET/EPIPE on the client side.
   for await (const chunk of req) {
-    chunks.push(chunk as Buffer);
+    const buf = chunk as Buffer;
+    total += buf.length;
+    if (total > maxBytes) {
+      overLimit = true;
+      continue;
+    }
+    chunks.push(buf);
+  }
+  if (overLimit) {
+    throw new PayloadTooLargeError(`Request body exceeds the ${maxBytes}-byte limit`);
   }
   const raw = Buffer.concat(chunks).toString("utf8");
   if (raw.length === 0) {
@@ -27,16 +47,25 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   return JSON.parse(raw);
 }
 
+function isAuthorized(req: IncomingMessage, apiKey: string): boolean {
+  return req.headers["x-api-key"] === apiKey;
+}
+
 export function createAttestationRequestHandler(deps: AttestationServiceDeps) {
   const logger = deps.logger ?? console;
   const allowedOperators = allowedOperatorsByKind(deps.config.parties);
-  const coSignTracker = new WeightCoSignTracker();
+  const coSignTracker = new WeightCoSignTracker({
+    ttlSeconds: deps.config.connectors.attestationService.weightCosignTtlSeconds,
+  });
 
   async function handleSubmitAttestation(req: IncomingMessage): Promise<JsonResponse> {
     let body: unknown;
     try {
-      body = await readJsonBody(req);
-    } catch {
+      body = await readJsonBody(req, MAX_RAW_BODY_BYTES);
+    } catch (err) {
+      if (err instanceof PayloadTooLargeError) {
+        return { status: 413, body: { error: err.message, code: "PAYLOAD_TOO_LARGE" } };
+      }
       return { status: 400, body: { error: "Request body must be valid JSON", code: "SCHEMA_VIOLATION" } };
     }
 
@@ -45,7 +74,8 @@ export function createAttestationRequestHandler(deps: AttestationServiceDeps) {
       submission = validateAttestationSubmission(body, allowedOperators);
     } catch (err) {
       if (err instanceof AttestationValidationError) {
-        return { status: 400, body: { error: err.message, code: err.code } };
+        const status = err.code === "EVIDENCE_TOO_LARGE" ? 413 : 400;
+        return { status, body: { error: err.message, code: err.code } };
       }
       throw err;
     }
@@ -72,7 +102,16 @@ export function createAttestationRequestHandler(deps: AttestationServiceDeps) {
       deviceId: submission.deviceId,
       submittedAt: new Date().toISOString(),
     };
-    const pair = coSignTracker.submit(submission.barSerial, half);
+
+    let pair;
+    try {
+      pair = coSignTracker.submit(submission.barSerial, half);
+    } catch (err) {
+      if (err instanceof CoSignConflictError) {
+        return { status: 409, body: { error: err.message, code: "COSIGN_CONFLICT" } };
+      }
+      throw err;
+    }
 
     if (!pair) {
       logger.info(`Weight attestation half (${role}) recorded for ${submission.barSerial}; awaiting co-signature`);
@@ -96,6 +135,10 @@ export function createAttestationRequestHandler(deps: AttestationServiceDeps) {
     try {
       if (req.method === "GET" && req.url === "/healthz") {
         respond(res, { status: 200, body: { status: "ok" } });
+        return;
+      }
+      if (!isAuthorized(req, deps.config.connectors.attestationService.apiKey)) {
+        respond(res, { status: 401, body: { error: "missing or invalid X-API-Key header", code: "UNAUTHORIZED" } });
         return;
       }
       if (req.method === "POST" && req.url === "/attestations") {

@@ -2,7 +2,7 @@ module Scripts.TestEndToEnd where
 
 import Daml.Script
 import DA.Date (Month(..), date)
-import DA.Time (time, days, seconds)
+import DA.Time (time, days)
 import DA.Optional (isNone)
 import Config
 import Attestations
@@ -240,10 +240,13 @@ transitLockdown = script do
     exerciseCmd esc Settle
 
   -- Drive the movement to Reconciled.
-  (mvReleased, idxReleased) <- submit p.custodian do
-    exerciseCmd mv ReleaseBar with movementIndexCid = idxRequested
-  (mvReceived, idxReceived) <- submit p.custodian do
-    exerciseCmd mvReleased ReceiveBar with actorRoleCid = transporterRole, movementIndexCid = idxReleased
+  (mvReleased, idxReleased) <- submitMulti [p.custodian, p.vaultKeeper] [] do
+    exerciseCmd mv ReleaseBar with actor = p.vaultKeeper, movementIndexCid = idxRequested
+  (mvReceived, idxReceived) <- submitMulti [p.custodian, p.transporter] [] do
+    exerciseCmd mvReleased ReceiveBar with
+      actorRoleCid = transporterRole
+      actor = p.transporter
+      movementIndexCid = idxReleased
   weighmasterRole <- appoint b p.weighmaster Weighmaster "Zurich-B" (days 30)
   weighDeviceRole <- appoint b p.weighDevice WeighDevice "Zurich-B" (days 30)
   (hAtt, idxAtt1) <- submit p.weighmaster do
@@ -265,7 +268,7 @@ transitLockdown = script do
       custodian = p.custodian
       weighmasterRoleCid = weighmasterRole
       weighDeviceRoleCid = weighDeviceRole
-      configToleranceGrams = defaultSystemParams.weightMatchToleranceGrams
+      configCid = b.configCid
   confirmedWeight <- submit p.custodian do
     exerciseCmd weightAuth ConfirmWeight with humanAttCid = hAtt, deviceAttCid = dAtt, location = "Zurich-B"
   (_mvReconciled, _presenceAtt, _idxAtt3, idxReconciled) <- submitMulti [p.custodian, p.vaultKeeper] [] do
@@ -328,7 +331,7 @@ auditCrisis = script do
 
   -- Crisis rule: the custodian cannot unilaterally wave the problem away.
   submitMustFail p.custodian do
-    exerciseCmd reportCid MarkResolved
+    exerciseCmd reportCid MarkResolved with discrepancyIndexCid = idxOpen
 
   -- Trading at the affected vault site is locked out while the report is open.
   kycCid <- submit p.complianceProvider do
@@ -362,15 +365,19 @@ auditCrisis = script do
   submitMultiMustFail [p.investor1, p.cashIssuer] [p.custodian] do
     exerciseCmd esc Settle
 
-  -- Settle failed, so the gold is still locked inside the escrow, not under
-  -- the original goldCid (AcceptAndFund already re-created it as escrow-held).
-  Some lockedEscrow <- queryContractId p.custodian esc
-  let lockedGoldCid = lockedEscrow.goldCid
+  -- Settle failed, so the gold is still CIP-56 locked inside the escrow
+  -- (AcceptAndFund already re-created it as escrow-held). GoldHolding rejects
+  -- write-downs on an actively-locked holding, so the stalled escrow must
+  -- expire and be cancelled — which returns unlocked holdings — before the
+  -- custodian+auditor can write it down.
+  passTime (days 1)
+  (goldBack, _cashBack) <- submitMulti [p.custodian, p.cashIssuer] [p.investor1] do
+    exerciseCmd esc Cancel
 
   -- Joint write-down: haircut resolves the report and shrinks the holding.
   (_newLedger, remainingOpt) <- submitMulti [p.custodian, p.auditor] [] do
     exerciseCmd reportCid WriteDown with
-      holdingCid = lockedGoldCid
+      holdingCid = goldBack
       ledgerCid = ledger1
       serial = "BAR-CRISIS-1"
       burnGrams = 50.0

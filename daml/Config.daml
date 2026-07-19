@@ -33,6 +33,17 @@ defaultSystemParams = SystemParams with
     weightMatchToleranceGrams = 0.01
     inKindRedemptionThresholdGrams = 1000.0
 
+-- | Structural validation of business parameters — enforced whenever a
+-- SystemConfig is (re)configured so no consumer ever observes nonsensical
+-- values (e.g. non-positive gramsPerUnit, out-of-range purity).
+assertValidParams : SystemParams -> Update ()
+assertValidParams params = do
+  assertMsg "gramsPerUnit must be positive" (params.gramsPerUnit > 0.0)
+  assertMsg "minPurity must be in (0,1]" (params.minPurity > 0.0 && params.minPurity <= 1.0)
+  assertMsg "weightMatchToleranceGrams must be non-negative" (params.weightMatchToleranceGrams >= 0.0)
+  assertMsg "maxOracleDivergenceBps must be non-negative" (params.maxOracleDivergenceBps >= 0)
+  assertMsg "inKindRedemptionThresholdGrams must be non-negative" (params.inKindRedemptionThresholdGrams >= 0.0)
+
 template SystemConfig
   with
     operator : Party
@@ -42,13 +53,18 @@ template SystemConfig
     signatory operator
     observer observers
 
-    -- | Archive and recreate with new params. Returns the new contract id.
-    choice UpdateConfig : ContractId SystemConfig
+    -- | Create a NEW SystemConfig with updated params without archiving this
+    -- one — nonconsuming so any holder still referencing the old configCid
+    -- (fetched into an in-flight escrow/fund/index choice) is never orphaned
+    -- by a config change made concurrently by the operator. Callers that want
+    -- the latest params must re-fetch using the returned cid.
+    nonconsuming choice UpdateConfig : ContractId SystemConfig
       with
         newParams : SystemParams
       controller operator
       do
-        create this with params = newParams
+        assertValidParams newParams
+        create SystemConfig with operator, params = newParams, observers
 
 -- | Helper for consumers: fetch params from a config cid.
 fetchParams : ContractId SystemConfig -> Update SystemParams

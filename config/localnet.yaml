@@ -26,6 +26,11 @@ ledger:
   grpcHost: localhost
   grpcPort: 6865
   cnQuickstartPath: ../cn-quickstart
+  # mock (default): every connector uses the in-memory MockLedgerClient, for
+  # local/unit convenience. live: connectors require JsonLedgerClient against
+  # jsonApiUrl (see connector/shared/src/ledgerClient.ts). Overridable via the
+  # LEDGER_MODE env var.
+  mode: mock
 
 business:
   minPurity: "0.995"
@@ -45,6 +50,7 @@ business:
 connectors:
   navPublisher:
     port: 8101
+    host: 127.0.0.1
     xauSources:
       - type: fixture
         name: fixture-primary
@@ -54,7 +60,13 @@ connectors:
         path: ./connector/nav-publisher/fixtures/xau.json
   attestationService:
     port: 8102
+    host: 127.0.0.1
     evidenceStore: ./evidence-store
+    # Required X-API-Key header value for every request but /healthz.
+    # Local-dev-only default; rotate/replace before any non-local use.
+    apiKey: local-dev-key
+    # How long a lone Weight attestation half is kept awaiting its co-signature.
+    weightCosignTtlSeconds: 3600
   iso20022:
     inboxDir: ./connector/iso20022-adapter/inbox
     outboxDir: ./connector/iso20022-adapter/outbox

@@ -91,6 +91,38 @@ const parser = new XMLParser({
   parseAttributeValue: false,
 });
 
+/** Tags SCHEMA.md documents as required on an inbound setr.010 message. */
+const SETR_010_REQUIRED_TAGS = [
+  "<SubscriptionBulkOrder>",
+  "<MsgId>",
+  "<CreDtTm>",
+  "<SubscriptionRequestId>",
+  "<InvestorParty>",
+  "<FinInstrmId>",
+  "<Amt ",
+] as const;
+
+export class Setr010StructureError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "Setr010StructureError";
+  }
+}
+
+/**
+ * Light structural check (not a full XSD validation) run on every inbound
+ * setr.010 file before it is parsed and submitted to the ledger: every
+ * documented required tag must be textually present. Malformed/incomplete
+ * files fail fast here and are quarantined into inbox/failed/ by the
+ * caller instead of reaching parseSetr010 in a partially-valid state.
+ */
+export function assertSetr010StructureValid(xml: string): void {
+  const missing = SETR_010_REQUIRED_TAGS.filter((tag) => !xml.includes(tag));
+  if (missing.length > 0) {
+    throw new Setr010StructureError(`setr.010 message is missing required tag(s): ${missing.join(", ")}`);
+  }
+}
+
 function requireString(value: unknown, field: string): string {
   if (typeof value === "string" && value.length > 0) {
     return value;

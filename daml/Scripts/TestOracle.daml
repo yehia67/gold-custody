@@ -66,6 +66,8 @@ testDivergenceProposeAndConfirm = script do
       value = 2200.0
       sources = sampleSources
       observers = [p.custodian]
+  -- The confirmer must itself be a validated OracleOperator.
+  regulatorOracleRole <- appoint b p.regulator OracleOperator "Global" (days 30)
   proposalCid <- submitMulti [p.custodian, p.oracleOp1] [] do
     exerciseCmd oracleAuthCid ProposeDivergentPrice with
       roleCid = oracleRole
@@ -75,7 +77,9 @@ testDivergenceProposeAndConfirm = script do
       value = 2200.0
       sources = sampleSources
   (pp2, idx2) <- submitMulti [p.regulator, p.custodian] [] do
-    exerciseCmd proposalCid ConfirmDivergentPrice with observers = [p.custodian]
+    exerciseCmd proposalCid ConfirmDivergentPrice with
+      observers = [p.custodian]
+      confirmerRoleCid = regulatorOracleRole
   Some price2 <- queryContractId p.custodian pp2
   assertMsg "divergent price confirmed at proposed value" (price2.value == 2200.0)
   Some idx2Data <- queryContractId p.custodian idx2
@@ -90,7 +94,9 @@ testDivergenceProposeAndConfirm = script do
       value = 2400.0
       sources = sampleSources
   submitMultiMustFail [p.oracleOp1, p.custodian] [] do
-    exerciseCmd proposalCid2 ConfirmDivergentPrice with observers = [p.custodian]
+    exerciseCmd proposalCid2 ConfirmDivergentPrice with
+      observers = [p.custodian]
+      confirmerRoleCid = oracleRole
 
 testNonNavAgentCannotPublish = script do
   p <- allocateParties

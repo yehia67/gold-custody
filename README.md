@@ -1,4 +1,4 @@
-# Gold Custody — Canton Tokenized Gold, Escrow & Fund Settlement
+# Gold Custody Canton Tokenized Gold, Escrow & Fund Settlement
 
 Production-grade prototype of tokenized gold custody, dual-signature attestations, compliance-gated escrow, and fund subscription/redemption on the Canton Network (Daml + CIP-56), with TypeScript off-ledger connectors.
 
@@ -53,6 +53,12 @@ make test-connectors
 # or: cd connector && npm install && npm test
 LOCALNET=1 make test-connectors   # enable nav-publisher LocalNet integration test
 ```
+
+attestation-service requires an `X-API-Key` header matching `connectors.attestationService.apiKey`
+(config/localnet.yaml; local-dev default `local-dev-key` — rotate before any non-local use) on every
+request but `/healthz`, and binds to `127.0.0.1` by default. All three connectors default to
+`ledger.mode: mock` (in-memory `MockLedgerClient`); set `ledger.mode: live` (or `LEDGER_MODE=live`)
+to require the thin `JsonLedgerClient` stub instead — see `connector/shared/src/ledgerClient.ts`.
 
 ## Demo
 

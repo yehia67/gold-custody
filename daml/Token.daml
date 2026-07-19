@@ -53,6 +53,25 @@ upsertAmount serial amount xs =
 totalMinted : IssuanceLedger -> Decimal
 totalMinted ledger = foldl (+) 0.0 [a | (_, a) <- ledger.minted]
 
+-- | CIP-56 guidance: registries SHOULD allow holdings with *expired* locks as
+-- transfer inputs, but MUST reject holdings under an active (non-expired) lock.
+isLockActive : Optional Lock -> Time -> Bool
+isLockActive None _ = False
+isLockActive (Some l) now = case l.expiresAt of
+  Some expiresAt -> not (expiresAt < now)
+  None -> True
+
+assertUnlocked : Optional Lock -> Update ()
+assertUnlocked lock = do
+  now <- getTime
+  assertMsg "Holding is locked" (not (isLockActive lock now))
+
+-- | Preserve first-occurrence order while removing duplicates — used to union
+-- backing serials across transfer inputs without relying on Ord.
+dedupPreserveOrder : [Text] -> [Text]
+dedupPreserveOrder [] = []
+dedupPreserveOrder (x :: xs) = x :: dedupPreserveOrder (filter (/= x) xs)
+
 -- | CIP-56 Gold holding.
 template GoldHolding
   with
@@ -81,6 +100,7 @@ template GoldHolding
         newOwner : Party
       controller owner
       do
+        assertUnlocked lock
         create this with owner = newOwner
 
     choice BurnGold : ContractId IssuanceLedger
@@ -99,6 +119,7 @@ template GoldHolding
         burnGrams : Decimal
       controller issuer
       do
+        assertUnlocked lock
         assertMsg "burnGrams must be positive" (burnGrams > 0.0)
         assertMsg "burnGrams exceeds holding" (burnGrams < amountGrams)
         assertMsg "Serial must be in backing" (serial `elem` backingSerials)
@@ -133,6 +154,7 @@ template CashHolding
         newOwner : Party
       controller owner
       do
+        assertUnlocked lock
         create this with owner = newOwner
 
     choice SplitCash : (ContractId CashHolding, ContractId CashHolding)
@@ -140,6 +162,7 @@ template CashHolding
         takeAmount : Decimal
       controller owner
       do
+        assertUnlocked lock
         assertMsg "takeAmount must be positive" (takeAmount > 0.0)
         assertMsg "takeAmount exceeds balance" (takeAmount < amount)
         a <- create this with amount = takeAmount
@@ -148,7 +171,7 @@ template CashHolding
 
     choice ConsumeCash : ()
       controller owner
-      do pure ()
+      do assertUnlocked lock
 
 template CashIssuerRole
   with
@@ -187,7 +210,7 @@ template GoldTransferFactory
         now <- getTime
         assertMsg "executeBefore in the past" (arg.transfer.executeBefore > now)
         assertMsg "requestedAt must be in the past" (arg.transfer.requestedAt <= now)
-        inputAmounts <- mapA (\cid -> do
+        inputResults <- mapA (\cid -> do
           iface <- fetch cid
           let v = view iface
           assertMsg "Input owner must be sender" (v.owner == arg.transfer.sender)
@@ -195,17 +218,25 @@ template GoldTransferFactory
           opt <- fetchFromInterface @GoldHolding cid
           case opt of
             None -> abort "Input holding is not GoldHolding"
-            Some (goldCid, _) -> do
+            Some (goldCid, gh) -> do
+              assertUnlocked gh.lock
               archive goldCid
-              pure v.amount) arg.transfer.inputHoldingCids
-        let totalIn = foldl (+) 0.0 inputAmounts
+              pure (v.amount, gh.backingSerials)) arg.transfer.inputHoldingCids
+        let totalIn = foldl (+) 0.0 (map fst inputResults)
         assertMsg "Insufficient input amount" (totalIn >= arg.transfer.amount)
         let change = totalIn - arg.transfer.amount
+        -- CIP-56 provenance: carry forward the real backing serials of the
+        -- consumed inputs rather than a placeholder string. A proportional
+        -- split of provenance between the receiver and change outputs would
+        -- need a per-serial accounting scheme; keeping the full de-duplicated
+        -- union on both outputs is the simplest choice that never drops or
+        -- fabricates provenance.
+        let allSerials = dedupPreserveOrder (concatMap snd inputResults)
         recvCid <- create GoldHolding with
           issuer = admin
           owner = arg.transfer.receiver
           amountGrams = arg.transfer.amount
-          backingSerials = ["TRANSFERRED"]
+          backingSerials = allSerials
           instrumentId = arg.transfer.instrumentId
           lock = None
           meta = emptyMetadata
@@ -214,7 +245,7 @@ template GoldTransferFactory
               issuer = admin
               owner = arg.transfer.sender
               amountGrams = change
-              backingSerials = ["CHANGE"]
+              backingSerials = allSerials
               instrumentId = arg.transfer.instrumentId
               lock = None
               meta = emptyMetadata

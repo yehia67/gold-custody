@@ -3,7 +3,7 @@ module Compliance where
 import DA.Time (RelTime, subTime)
 import Config (SystemConfig, fetchParams)
 import Attestations
-  ( AttestationKind(..), AttestationIndex, lookupAttestation, lookupAttestedAt )
+  ( AttestationKind(..), AttestationIndex, lookupAttestedAt, lookupSemanticOk )
 import Movement (MovementIndex, hasOpenMovement)
 import Discrepancy (DiscrepancyIndex, hasOpenDiscrepancy)
 
@@ -200,7 +200,9 @@ checkFresh idx now maxAge serial kind =
       let age = subTime now attestedAt
       in if age > maxAge
          then pure (CheckFailed (show kind <> " attestation stale for " <> serial))
-         else pure CheckPassed
+         else case lookupSemanticOk idx serial kind of
+           Some False -> pure (CheckFailed (show kind <> " attestation failed its own payload check for " <> serial))
+           _ -> pure CheckPassed
 
 foldCheck : [CheckResult] -> CheckResult
 foldCheck [] = CheckPassed

@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { defaultConfigPath, loadConfig, MockLedgerClient, resolveConfigPath } from "@gold-custody/shared";
+import { createLedgerClient, defaultConfigPath, loadConfig, resolveConfigPath } from "@gold-custody/shared";
 import { createXauSource } from "./sources";
 import { checkAndPublish, startPublishLoop, type PublishOutcome } from "./publisher";
 
@@ -9,10 +9,10 @@ function main(): void {
     createXauSource(sourceConfig, (relativePath) => resolveConfigPath(config, relativePath)),
   );
 
-  // No real Canton JSON Ledger API client is implemented in this prototype
-  // (see shared/src/ledgerClient.ts); MockLedgerClient is the default
-  // standalone-runnable wiring until one exists.
-  const ledgerClient = new MockLedgerClient();
+  // Uses MockLedgerClient unless ledger.mode: live (or LEDGER_MODE=live) is
+  // set, in which case a JsonLedgerClient is required — see
+  // shared/src/ledgerClient.ts.
+  const ledgerClient = createLedgerClient(config.ledger);
   const publisherOptions = {
     sources,
     maxOracleDivergenceBps: config.business.maxOracleDivergenceBps,
@@ -20,9 +20,13 @@ function main(): void {
   };
 
   let lastOutcome: PublishOutcome | undefined;
-  checkAndPublish(publisherOptions).then((outcome) => {
-    lastOutcome = outcome;
-  });
+  checkAndPublish(publisherOptions)
+    .then((outcome) => {
+      lastOutcome = outcome;
+    })
+    .catch((err) => {
+      console.error(`nav-publisher initial publish failed: ${(err as Error).message}`);
+    });
   const stopLoop = startPublishLoop(publisherOptions, config.business.navPublishIntervalSeconds);
 
   const server = createServer((req, res) => {
@@ -34,9 +38,10 @@ function main(): void {
     res.writeHead(404, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: "not found" }));
   });
-  server.listen(config.connectors.navPublisher.port, () => {
+  const { port, host } = config.connectors.navPublisher;
+  server.listen(port, host, () => {
     console.log(
-      `nav-publisher healthz on port ${config.connectors.navPublisher.port} ` +
+      `nav-publisher healthz on ${host}:${port} ` +
         `(interval ${config.business.navPublishIntervalSeconds}s, ${sources.length} XAU sources)`,
     );
   });

@@ -140,6 +140,35 @@ testExpiryCancel = script do
   submitMultiMustFail [p.investor1, p.cashIssuer] [p.custodian] do
     exerciseCmd esc Settle
 
+-- | AcceptAndFund CIP-56-locks both legs (holders = [seller, buyer]) — neither
+-- side can move the gold or spend the cash out from under the escrow while
+-- it is open, even though each still nominally "owns" their locked holding.
+testLockedHoldingsCannotMoveMidEscrow = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  fx <- setupEscrowFixture b "BAR-ESC-6" 90.0 450.0
+  prop <- proposeEscrow b fx 450.0 None
+  esc <- submitMulti [p.investor1, p.cashIssuer] [p.custodian] do
+    exerciseCmd prop AcceptAndFund with cashHoldingCid = fx.cashCid
+  Some escrow <- queryContractId p.custodian esc
+  -- Locked gold cannot be transferred by the seller while escrow is open.
+  submitMustFail p.custodian do
+    exerciseCmd escrow.goldCid TransferGold with newOwner = p.investor2
+  -- Locked cash cannot be consumed by the buyer while escrow is open.
+  submitMustFail p.investor1 do
+    exerciseCmd escrow.cashCid ConsumeCash
+  -- Once the escrow expires, Cancel unlocks both legs again for their owners.
+  passTime (seconds 86401)
+  (goldBack, cashBack) <- submitMulti [p.custodian, p.cashIssuer] [p.investor1] do
+    exerciseCmd esc Cancel
+  unlockedAgain <- submit p.custodian do
+    exerciseCmd goldBack TransferGold with newOwner = p.investor2
+  Some finalGold <- queryContractId p.investor2 unlockedAgain
+  assertMsg "gold transferable again once unlocked by Cancel" (finalGold.owner == p.investor2)
+  submit p.investor1 do
+    exerciseCmd cashBack ConsumeCash
+
 testUnauthorizedSettleFails = script do
   p <- allocateParties
   setTime (time (date 2026 Jan 1) 0 0 0)

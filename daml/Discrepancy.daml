@@ -20,8 +20,13 @@ template DiscrepancyReport
     ensure length affectedSerials > 0 && T.length rationale > 0
 
     choice MarkResolved : ContractId DiscrepancyReport
+      with
+        discrepancyIndexCid : ContractId DiscrepancyIndex
       controller custodian, auditor
-      do create this with resolved = True
+      do
+        newReport <- create this with resolved = True
+        _ <- exercise discrepancyIndexCid MarkEntryResolved with reportCid = self
+        pure newReport
 
     -- | Joint write-down: custodian + auditor burn/haircut a holding.
     choice WriteDown : (ContractId IssuanceLedger, Optional (ContractId GoldHolding))

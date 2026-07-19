@@ -3,6 +3,7 @@ module Escrow where
 import Config (SystemConfig, fetchParams)
 import Compliance (ComplianceCheck, runChecks)
 import Token (GoldHolding, CashHolding)
+import Splice.Api.Token.HoldingV1 (Lock(..))
 import DA.Time (RelTime, addRelTime)
 
 -- | Seller proposes an escrow for a gold holding against cash.
@@ -25,6 +26,7 @@ template EscrowProposal
   where
     signatory seller
     observer buyer, cashIssuer
+    ensure not (null requiredChecks)
 
     choice AcceptAndFund : ContractId GoldEscrow
       with
@@ -42,12 +44,22 @@ template EscrowProposal
         let expiryRel = case expiryOverride of
               Some r -> r
               None -> params.escrowDefaultExpiry
-        -- Lock by transferring both holdings to escrow (re-create under escrow parties).
-        -- Archive inputs by consuming via transfer-to-escrow pattern:
+        -- Compute the absolute expiry before creating anything so the lock on
+        -- both legs and the escrow's own expiresAt agree exactly.
+        let expiresAt = addRelTime now expiryRel
+        let escrowLock = Some Lock with
+              holders = [seller, buyer]
+              expiresAt = Some expiresAt
+              expiresAfter = None
+              context = Some "escrow"
+        -- CIP-56 lock: archive the free inputs and recreate them under the
+        -- same owners but with an active Lock naming both escrow parties as
+        -- holders — this is what actually prevents either side from moving
+        -- the holding out from under the escrow while it's open.
         archive goldCid
         archive cashHoldingCid
-        lockedGold <- create gold with owner = seller -- still seller-signed; escrow tracks cid
-        lockedCash <- create cash with owner = buyer
+        lockedGold <- create gold with owner = seller, lock = escrowLock
+        lockedCash <- create cash with owner = buyer, lock = escrowLock
         create GoldEscrow with
           seller
           buyer
@@ -57,7 +69,7 @@ template EscrowProposal
           cashIssuer
           requiredChecks
           configCid
-          expiresAt = addRelTime now expiryRel
+          expiresAt
 
 template GoldEscrow
   with
@@ -79,6 +91,7 @@ template GoldEscrow
         newChecks : [ContractId ComplianceCheck]
       controller seller, buyer
       do
+        assertMsg "checks must be non-empty" (not (null newChecks))
         create this with requiredChecks = newChecks
 
     choice Settle : (ContractId GoldHolding, ContractId CashHolding)
@@ -92,8 +105,9 @@ template GoldEscrow
         cash <- fetch cashCid
         archive goldCid
         archive cashCid
-        newGold <- create gold with owner = buyer
-        newCash <- create cash with owner = seller
+        -- Final owners receive unlocked holdings — the escrow lock's job ends here.
+        newGold <- create gold with owner = buyer, lock = None
+        newCash <- create cash with owner = seller, lock = None
         pure (newGold, newCash)
 
     choice Cancel : (ContractId GoldHolding, ContractId CashHolding)
@@ -105,6 +119,7 @@ template GoldEscrow
         cash <- fetch cashCid
         archive goldCid
         archive cashCid
-        newGold <- create gold with owner = seller
-        newCash <- create cash with owner = buyer
+        -- Final owners receive unlocked holdings — the escrow lock's job ends here.
+        newGold <- create gold with owner = seller, lock = None
+        newCash <- create cash with owner = buyer, lock = None
         pure (newGold, newCash)

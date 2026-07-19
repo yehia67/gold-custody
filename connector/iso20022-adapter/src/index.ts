@@ -1,4 +1,4 @@
-import { defaultConfigPath, loadConfig, MockLedgerClient, resolveConfigPath } from "@gold-custody/shared";
+import { createLedgerClient, defaultConfigPath, loadConfig, resolveConfigPath } from "@gold-custody/shared";
 import { Iso20022Adapter } from "./adapter";
 
 export { Iso20022Adapter, type Iso20022AdapterOptions } from "./adapter";
@@ -8,10 +8,10 @@ const POLL_INTERVAL_MS = 2000;
 
 function main(): void {
   const config = loadConfig(defaultConfigPath());
-  // No real Canton JSON Ledger API client is implemented in this prototype
-  // (see shared/src/ledgerClient.ts); MockLedgerClient is the default
-  // standalone-runnable wiring until one exists.
-  const ledgerClient = new MockLedgerClient();
+  // Uses MockLedgerClient unless ledger.mode: live (or LEDGER_MODE=live) is
+  // set, in which case a JsonLedgerClient is required — see
+  // shared/src/ledgerClient.ts.
+  const ledgerClient = createLedgerClient(config.ledger);
 
   const adapter = new Iso20022Adapter({
     ledgerClient,
