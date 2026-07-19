@@ -2,14 +2,17 @@ module Scripts.TestToken where
 
 import Daml.Script
 import DA.Date (Month(..), date)
-import DA.Time (time, days)
+import DA.Time (time, days, addRelTime)
 import Config
 import Token
 import Operators
+import Splice.Api.Token.HoldingV1 (Holding, InstrumentId(..))
+import Splice.Api.Token.MetadataV1 (emptyMetadata, ExtraArgs(..), emptyChoiceContext)
+import Splice.Api.Token.TransferInstructionV1
+  ( TransferFactory, TransferFactory_Transfer(..), Transfer(..)
+  , TransferInstructionResult_Output(..) )
 import Scripts.Setup
-  ( allocateParties, bootstrapSystem, appoint, registerAndAssay, mintGold
-  , Bootstrap(..), BarSetup(..)
-  )
+  ( allocateParties, bootstrapSystem, appoint, registerAndAssay, mintGold )
 
 testOverMintFails = script do
   p <- allocateParties
@@ -102,6 +105,51 @@ testBurnReducesIssuanceLedger = script do
   -- The burned holding is gone; the owner can no longer transfer it.
   submitMustFail p.investor1 do
     exerciseCmd holdingCid TransferGold with newOwner = p.investor2
+
+-- | GoldTransferFactory carries the real backing serials of the consumed
+-- inputs onto both the receiver holding and the sender's change holding —
+-- never the old "TRANSFERRED"/"CHANGE" placeholders — and rejects locked inputs.
+testTransferFactoryPreservesProvenance = script do
+  p <- allocateParties
+  now <- pure (time (date 2026 Jan 1) 0 0 0)
+  setTime now
+  b <- bootstrapSystem p defaultSystemParams
+  assayerRole <- appoint b p.assayer Assayer "Zurich-A" (days 30)
+  bs1 <- registerAndAssay b assayerRole b.registryCid b.indexCid "BAR-TF-1" 1000.0 0.999
+  (holding1, ledger1) <- mintGold b bs1 b.ledgerCid p.investor1 100.0
+  bs2 <- registerAndAssay b assayerRole bs1.registryCid bs1.indexCid "BAR-TF-2" 1000.0 0.999
+  (holding2, _ledger2) <- mintGold b bs2 ledger1 p.investor1 50.0
+
+  factoryCid <- submit p.custodian do
+    createCmd GoldTransferFactory with admin = p.custodian, meta = emptyMetadata
+  -- The factory is only signed by the custodian; the sender needs the contract
+  -- explicitly disclosed to exercise the (public, per CIP-56) factory choice.
+  Some factoryDisclosure <- queryDisclosure p.custodian factoryCid
+  let instrumentId = InstrumentId with admin = p.custodian, id = "XAU-BAR"
+  result <- submit (actAs p.investor1 <> disclose factoryDisclosure) do
+    exerciseCmd (toInterfaceContractId @TransferFactory factoryCid) TransferFactory_Transfer with
+      expectedAdmin = p.custodian
+      transfer = Transfer with
+        sender = p.investor1
+        receiver = p.investor2
+        amount = 120.0
+        instrumentId
+        requestedAt = now
+        executeBefore = addRelTime now (days 1)
+        inputHoldingCids = [toInterfaceContractId @Holding holding1, toInterfaceContractId @Holding holding2]
+        meta = emptyMetadata
+      extraArgs = ExtraArgs with context = emptyChoiceContext, meta = emptyMetadata
+  TransferInstructionResult_Completed [recvHoldingCid] <- pure result.output
+  let recvGoldCid = fromInterfaceContractId @GoldHolding recvHoldingCid
+  Some recvGold <- queryContractId p.investor2 recvGoldCid
+  assertMsg "receiver holding carries real backing serials, not a placeholder"
+    (recvGold.backingSerials == ["BAR-TF-1", "BAR-TF-2"] || recvGold.backingSerials == ["BAR-TF-2", "BAR-TF-1"])
+  [changeHoldingCid] <- pure result.senderChangeCids
+  let changeGoldCid = fromInterfaceContractId @GoldHolding changeHoldingCid
+  Some changeGold <- queryContractId p.investor1 changeGoldCid
+  assertMsg "change amount is the leftover input" (changeGold.amountGrams == 30.0)
+  assertMsg "change also carries real backing serials, not a placeholder"
+    (changeGold.backingSerials == ["BAR-TF-1", "BAR-TF-2"] || changeGold.backingSerials == ["BAR-TF-2", "BAR-TF-1"])
 
 testNonCustodianMintFails = script do
   p <- allocateParties

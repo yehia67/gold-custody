@@ -54,3 +54,31 @@ testConfigUnauthorizedUpdateFails = script do
     createCmd SystemConfig with operator = p.systemOperator, params = defaultSystemParams, observers = []
   submitMustFail p.custodian do
     exerciseCmd cfgCid UpdateConfig with newParams = defaultSystemParams with minPurity = 0.99
+
+-- | UpdateConfig validates the new params (assertValidParams) before creating
+-- the replacement SystemConfig — nonsensical params never make it on-ledger.
+testConfigInvalidParamsRejected = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  cfgCid <- submit p.systemOperator do
+    createCmd SystemConfig with operator = p.systemOperator, params = defaultSystemParams, observers = []
+  submitMustFail p.systemOperator do
+    exerciseCmd cfgCid UpdateConfig with newParams = defaultSystemParams with gramsPerUnit = 0.0
+  submitMustFail p.systemOperator do
+    exerciseCmd cfgCid UpdateConfig with newParams = defaultSystemParams with minPurity = 0.0
+  submitMustFail p.systemOperator do
+    exerciseCmd cfgCid UpdateConfig with newParams = defaultSystemParams with minPurity = 1.01
+  submitMustFail p.systemOperator do
+    exerciseCmd cfgCid UpdateConfig with newParams = defaultSystemParams with weightMatchToleranceGrams = -0.01
+  submitMustFail p.systemOperator do
+    exerciseCmd cfgCid UpdateConfig with newParams = defaultSystemParams with maxOracleDivergenceBps = -1
+  submitMustFail p.systemOperator do
+    exerciseCmd cfgCid UpdateConfig with newParams = defaultSystemParams with inKindRedemptionThresholdGrams = -1.0
+  -- The original config is untouched (UpdateConfig is nonconsuming), and a
+  -- valid update still succeeds afterwards.
+  Some original <- queryContractId p.systemOperator cfgCid
+  assertMsg "original config survives failed update attempts" (original.params.minPurity == 0.995)
+  newCfgCid <- submit p.systemOperator do
+    exerciseCmd cfgCid UpdateConfig with newParams = defaultSystemParams with minPurity = 0.999
+  Some newCfg <- queryContractId p.systemOperator newCfgCid
+  assertMsg "valid update still succeeds" (newCfg.params.minPurity == 0.999)

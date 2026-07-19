@@ -49,25 +49,30 @@ testOutOfOrderFails = script do
       toLocation = "Zurich-B"
       requester = p.custodian
   -- Still Requested: ReceiveBar (which requires Released) must fail.
-  submitMustFail p.custodian do
-    exerciseCmd mv ReceiveBar with actorRoleCid = fx.transporterRole, movementIndexCid = idxRequested
+  submitMultiMustFail [p.custodian, p.transporter] [] do
+    exerciseCmd mv ReceiveBar with
+      actorRoleCid = fx.transporterRole
+      actor = p.transporter
+      movementIndexCid = idxRequested
   -- Release it properly, then trying to act on the now-stale/archived original
   -- movement cid (as if releasing again, out of order) must fail.
-  (mvReleased, idxReleased) <- submit p.custodian do
-    exerciseCmd mv ReleaseBar with movementIndexCid = idxRequested
-  submitMustFail p.custodian do
-    exerciseCmd mv ReleaseBar with movementIndexCid = idxReleased
+  (mvReleased, idxReleased) <- submitMulti [p.custodian, p.vaultKeeper] [] do
+    exerciseCmd mv ReleaseBar with actor = p.vaultKeeper, movementIndexCid = idxRequested
+  submitMultiMustFail [p.custodian, p.vaultKeeper] [] do
+    exerciseCmd mv ReleaseBar with actor = p.vaultKeeper, movementIndexCid = idxReleased
   -- And Receive is not yet valid to skip straight to Reconcile-adjacent state
   -- checks: attempting Receive with the wrong role on the correctly-released
   -- movement is covered by testWrongRoleFails; here, receiving twice on an
   -- already-received movement (double receive) must fail.
-  (_mvReceived, idxReceived) <- submit p.custodian do
+  (_mvReceived, idxReceived) <- submitMulti [p.custodian, p.transporter] [] do
     exerciseCmd mvReleased ReceiveBar with
       actorRoleCid = fx.transporterRole
+      actor = p.transporter
       movementIndexCid = idxReleased
-  submitMustFail p.custodian do
+  submitMultiMustFail [p.custodian, p.transporter] [] do
     exerciseCmd mvReleased ReceiveBar with
       actorRoleCid = fx.transporterRole
+      actor = p.transporter
       movementIndexCid = idxReceived
 
 testWrongRoleFails = script do
@@ -81,12 +86,13 @@ testWrongRoleFails = script do
       fromLocation = "Zurich-A"
       toLocation = "Zurich-B"
       requester = p.custodian
-  (mvReleased, idxReleased) <- submit p.custodian do
-    exerciseCmd mv ReleaseBar with movementIndexCid = idx1
+  (mvReleased, idxReleased) <- submitMulti [p.custodian, p.vaultKeeper] [] do
+    exerciseCmd mv ReleaseBar with actor = p.vaultKeeper, movementIndexCid = idx1
   -- Passing the VaultKeeper role where Transporter is required must fail.
-  submitMustFail p.custodian do
+  submitMultiMustFail [p.custodian, p.vaultKeeper] [] do
     exerciseCmd mvReleased ReceiveBar with
       actorRoleCid = fx.vaultKeeperRole
+      actor = p.vaultKeeper
       movementIndexCid = idxReleased
 
 testMovementCheckBlocksThenUnblocksEscrow = script do
@@ -146,11 +152,12 @@ testMovementCheckBlocksThenUnblocksEscrow = script do
     exerciseCmd esc1 Settle
 
   -- Drive the movement all the way to Reconciled.
-  (mvReleased, idxReleased) <- submit p.custodian do
-    exerciseCmd mv ReleaseBar with movementIndexCid = idxRequested
-  (mvReceived, idxReceived) <- submit p.custodian do
+  (mvReleased, idxReleased) <- submitMulti [p.custodian, p.vaultKeeper] [] do
+    exerciseCmd mv ReleaseBar with actor = p.vaultKeeper, movementIndexCid = idxRequested
+  (mvReceived, idxReceived) <- submitMulti [p.custodian, p.transporter] [] do
     exerciseCmd mvReleased ReceiveBar with
       actorRoleCid = fx.transporterRole
+      actor = p.transporter
       movementIndexCid = idxReleased
 
   weighmasterRole <- appoint b p.weighmaster Weighmaster "Zurich-B" (days 30)
@@ -174,7 +181,7 @@ testMovementCheckBlocksThenUnblocksEscrow = script do
       custodian = p.custodian
       weighmasterRoleCid = weighmasterRole
       weighDeviceRoleCid = weighDeviceRole
-      configToleranceGrams = defaultSystemParams.weightMatchToleranceGrams
+      configCid = b.configCid
   confirmedWeight <- submit p.custodian do
     exerciseCmd weightAuth ConfirmWeight with
       humanAttCid = hAtt

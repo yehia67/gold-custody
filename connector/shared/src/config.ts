@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse } from "yaml";
+import { z } from "zod";
 
 export interface PartiesConfig {
   systemOperator: string;
@@ -23,11 +24,16 @@ export interface PartiesConfig {
   cashIssuer: string;
 }
 
+/** `mock` (default) drives every connector's standalone/unit wiring with MockLedgerClient; `live` requires JsonLedgerClient. */
+export const LEDGER_MODES = ["mock", "live"] as const;
+export type LedgerMode = (typeof LEDGER_MODES)[number];
+
 export interface LedgerEndpointConfig {
   jsonApiUrl: string;
   grpcHost: string;
   grpcPort: number;
   cnQuickstartPath: string;
+  mode: LedgerMode;
 }
 
 export interface BusinessConfig {
@@ -59,12 +65,20 @@ export interface XauSourceConfig {
 
 export interface NavPublisherConfig {
   port: number;
+  /** Bind address for the healthz HTTP server; defaults to loopback-only. */
+  host: string;
   xauSources: XauSourceConfig[];
 }
 
 export interface AttestationServiceConfig {
   port: number;
+  /** Bind address for the HTTP server; defaults to loopback-only. */
+  host: string;
   evidenceStore: string;
+  /** Required value of the `X-API-Key` request header on every request but /healthz. */
+  apiKey: string;
+  /** How long a lone Weight attestation half is retained awaiting its co-signature before eviction. */
+  weightCosignTtlSeconds: number;
 }
 
 export interface Iso20022ConnectorConfig {
@@ -87,72 +101,134 @@ export interface GoldCustodyConfig {
   readonly configDir: string;
 }
 
-class ConfigValidationError extends Error {
+export class ConfigValidationError extends Error {
   constructor(path: string, message: string) {
     super(`Invalid config at ${path}: ${message}`);
     this.name = "ConfigValidationError";
   }
 }
 
-function requireSection<T>(raw: Record<string, unknown>, key: string, path: string): T {
-  const value = raw[key];
-  if (value === undefined || value === null || typeof value !== "object") {
-    throw new ConfigValidationError(path, `missing required section "${key}"`);
-  }
-  return value as T;
-}
+const partyId = () => z.string().trim().min(1, "must be a non-empty party id");
+const port = () => z.number().int().min(1).max(65535);
+const posInt = () => z.number().int().positive();
+const nonNegInt = () => z.number().int().nonnegative();
+const decimalString = () => z.string().trim().min(1);
 
-function requireArray<T>(raw: Record<string, unknown>, key: string, path: string): T[] {
-  const value = raw[key];
-  if (!Array.isArray(value)) {
-    throw new ConfigValidationError(path, `missing required array "${key}"`);
-  }
-  return value as T[];
+/**
+ * Runtime validation schema for the gold-custody YAML config. Field-level
+ * checks (port ranges, non-empty party ids, business thresholds, the
+ * xauSources discriminated union, etc.) replace the old "cast the parsed
+ * YAML to the expected TypeScript type and hope" approach: every field is
+ * actually checked before GoldCustodyConfig is handed to business logic.
+ *
+ * NOTE: the exported TypeScript types above are hand-written (not
+ * z.infer<...>) because the installed TypeScript 7.x preview does not
+ * reliably narrow discriminated-union member types inferred through zod's
+ * ZodDiscriminatedUnion (verified: switch/exhaustiveness checks on the
+ * inferred type silently degrade to `any`). The zod schema below is kept
+ * structurally identical to those hand-written types.
+ */
+const GoldCustodyConfigSchema = z.object({
+  parties: z.object({
+    systemOperator: partyId(),
+    custodian: partyId(),
+    regulator: partyId(),
+    fundManager: partyId(),
+    registrar: partyId(),
+    investor1: partyId(),
+    investor2: partyId(),
+    oracleOperator1: partyId(),
+    oracleOperator2: partyId(),
+    navAgent: partyId(),
+    weighmaster: partyId(),
+    weighDevice: partyId(),
+    assayer: partyId(),
+    transporter: partyId(),
+    auditor: partyId(),
+    complianceProvider: partyId(),
+    vaultKeeper: partyId(),
+    cashIssuer: partyId(),
+  }),
+  ledger: z.object({
+    jsonApiUrl: z.string().trim().min(1),
+    grpcHost: z.string().trim().min(1),
+    grpcPort: port(),
+    cnQuickstartPath: z.string().trim().min(1),
+    mode: z.enum(LEDGER_MODES).default("mock"),
+  }),
+  business: z.object({
+    minPurity: decimalString(),
+    attestationMaxAgeSeconds: posInt(),
+    assayValiditySeconds: posInt(),
+    navValiditySeconds: posInt(),
+    escrowDefaultExpirySeconds: posInt(),
+    maxOracleDivergenceBps: nonNegInt(),
+    proofOfReserveMaxAgeSeconds: posInt(),
+    gramsPerUnit: decimalString(),
+    weightMatchToleranceGrams: decimalString(),
+    inKindRedemptionThresholdGrams: decimalString(),
+    defaultTransferLimit: decimalString(),
+    defaultFeeBps: nonNegInt(),
+    navPublishIntervalSeconds: posInt(),
+  }),
+  connectors: z.object({
+    navPublisher: z.object({
+      port: port(),
+      host: z.string().trim().min(1).default("127.0.0.1"),
+      xauSources: z
+        .array(
+          z.discriminatedUnion("type", [
+            z.object({ type: z.literal("fixture"), name: z.string().trim().min(1), value: z.string().trim().min(1) }),
+            z.object({ type: z.literal("jsonFile"), name: z.string().trim().min(1), path: z.string().trim().min(1) }),
+          ]),
+        )
+        .min(1, "at least one XAU source is required"),
+    }),
+    attestationService: z.object({
+      port: port(),
+      host: z.string().trim().min(1).default("127.0.0.1"),
+      evidenceStore: z.string().trim().min(1),
+      apiKey: z.string().min(1, "attestationService.apiKey must be set (see config/localnet.yaml)"),
+      weightCosignTtlSeconds: posInt().default(3600),
+    }),
+    iso20022: z.object({
+      inboxDir: z.string().trim().min(1),
+      outboxDir: z.string().trim().min(1),
+    }),
+  }),
+});
+
+function formatZodError(error: z.ZodError): string {
+  return error.issues
+    .map((issue) => `${issue.path.length > 0 ? issue.path.join(".") : "(root)"}: ${issue.message}`)
+    .join("; ");
 }
 
 /**
- * Loads and validates the gold-custody YAML config (e.g. config/localnet.yaml).
- * All connector business logic reads ports, party ids, and business thresholds
- * from the object returned here rather than hardcoding them.
+ * Loads and validates the gold-custody YAML config (e.g. config/localnet.yaml)
+ * against GoldCustodyConfigSchema (zod). All connector business logic reads
+ * ports, party ids, and business thresholds from the object returned here
+ * rather than hardcoding them or trusting unvalidated YAML casts.
  */
 export function loadConfig(path: string): GoldCustodyConfig {
   const raw = readFileSync(path, "utf8");
-  const parsed = parse(raw) as Record<string, unknown>;
-  if (parsed === null || typeof parsed !== "object") {
-    throw new ConfigValidationError(path, "root document must be a mapping");
+  let parsed: unknown;
+  try {
+    parsed = parse(raw);
+  } catch (err) {
+    throw new ConfigValidationError(path, `not valid YAML (${(err as Error).message})`);
   }
 
-  const parties = requireSection<PartiesConfig>(parsed, "parties", path);
-  const ledger = requireSection<LedgerEndpointConfig>(parsed, "ledger", path);
-  const business = requireSection<BusinessConfig>(parsed, "business", path);
-  const connectors = requireSection<Record<string, unknown>>(parsed, "connectors", path);
+  const result = GoldCustodyConfigSchema.safeParse(parsed);
+  if (!result.success) {
+    throw new ConfigValidationError(path, formatZodError(result.error));
+  }
 
-  const navPublisher = requireSection<Omit<NavPublisherConfig, "xauSources">>(
-    connectors,
-    "navPublisher",
-    path,
-  );
-  const xauSources = requireArray<XauSourceConfig>(
-    connectors.navPublisher as Record<string, unknown>,
-    "xauSources",
-    path,
-  );
-  const attestationService = requireSection<AttestationServiceConfig>(
-    connectors,
-    "attestationService",
-    path,
-  );
-  const iso20022 = requireSection<Iso20022ConnectorConfig>(connectors, "iso20022", path);
-
+  // Safe: result.data was just validated field-by-field against
+  // GoldCustodyConfigSchema, which mirrors GoldCustodyConfig exactly (see
+  // note above on why this isn't expressed as z.infer<...> directly).
   return {
-    parties,
-    ledger,
-    business,
-    connectors: {
-      navPublisher: { ...navPublisher, xauSources },
-      attestationService,
-      iso20022,
-    },
+    ...(result.data as unknown as Omit<GoldCustodyConfig, "configDir">),
     configDir: join(path, ".."),
   };
 }

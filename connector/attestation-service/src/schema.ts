@@ -3,7 +3,31 @@ import { ATTESTATION_KINDS, type AttestationKind, type PartiesConfig } from "@go
 export type AttestationValidationErrorCode =
   | "SCHEMA_VIOLATION"
   | "MISSING_EVIDENCE"
-  | "UNKNOWN_OPERATOR";
+  | "UNKNOWN_OPERATOR"
+  | "EVIDENCE_TOO_LARGE";
+
+/** Decoded evidence artifacts above this size are rejected with EVIDENCE_TOO_LARGE (413). */
+export const MAX_EVIDENCE_BYTES = 512 * 1024;
+
+const BASE64_CHARSET_PATTERN = /^[A-Za-z0-9+/]*={0,2}$/;
+
+/**
+ * Strictly validates that `value` is well-formed standard base64: correct
+ * charset, a length that is a multiple of 4, and — critically — that
+ * decoding and re-encoding it reproduces the exact same string. That last
+ * check catches inputs that pass a naive charset check but encode
+ * non-canonical padding bits, which `Buffer.from(value, "base64")` would
+ * otherwise silently accept by dropping/truncating bits.
+ */
+export function isValidBase64(value: string): boolean {
+  if (value.length === 0 || value.length % 4 !== 0) {
+    return false;
+  }
+  if (!BASE64_CHARSET_PATTERN.test(value)) {
+    return false;
+  }
+  return Buffer.from(value, "base64").toString("base64") === value;
+}
 
 export class AttestationValidationError extends Error {
   readonly code: AttestationValidationErrorCode;
@@ -86,14 +110,18 @@ export function validateAttestationSubmission(
   if (!isNonEmptyString(record.evidence)) {
     throw new AttestationValidationError("MISSING_EVIDENCE", '"evidence" (base64) is required');
   }
-  let decoded: Buffer;
-  try {
-    decoded = Buffer.from(record.evidence, "base64");
-  } catch {
+  if (!isValidBase64(record.evidence)) {
     throw new AttestationValidationError("SCHEMA_VIOLATION", '"evidence" must be valid base64');
   }
+  const decoded = Buffer.from(record.evidence, "base64");
   if (decoded.length === 0) {
     throw new AttestationValidationError("MISSING_EVIDENCE", '"evidence" decodes to zero bytes');
+  }
+  if (decoded.length > MAX_EVIDENCE_BYTES) {
+    throw new AttestationValidationError(
+      "EVIDENCE_TOO_LARGE",
+      `"evidence" decodes to ${decoded.length} bytes, exceeding the ${MAX_EVIDENCE_BYTES}-byte limit`,
+    );
   }
 
   const typedKind = kind as AttestationKind;

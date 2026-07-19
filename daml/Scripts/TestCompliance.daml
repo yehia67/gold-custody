@@ -91,7 +91,7 @@ testConfirmedWeightHappyAndMismatch = script do
       custodian = p.custodian
       weighmasterRoleCid = wm
       weighDeviceRoleCid = wd
-      configToleranceGrams = defaultSystemParams.weightMatchToleranceGrams
+      configCid = b.configCid
   cw <- submit p.custodian do
     exerciseCmd auth ConfirmWeight with humanAttCid = hAtt, deviceAttCid = dAtt, location = "Zurich-A"
   Some confirmed <- queryContractId p.custodian cw
@@ -147,9 +147,86 @@ testConfirmedWeightSameAttestorFails = script do
       custodian = p.custodian
       weighmasterRoleCid = wm
       weighDeviceRoleCid = wdSame
-      configToleranceGrams = defaultSystemParams.weightMatchToleranceGrams
+      configCid = b.configCid
   submitMustFail p.custodian do
     exerciseCmd auth ConfirmWeight with humanAttCid = hAtt, deviceAttCid = dAtt, location = "Zurich-A"
+
+-- | ProofOfReserveCheck passes when the latest AuditResult attestation for
+-- every backing serial is both fresh and reports passed = True.
+testProofOfReservePass = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  auditorRole <- appoint b p.auditor Auditor "Zurich-A" (days 30)
+  (_auditAttCid, idx1) <- submit p.auditor do
+    exerciseCmd auditorRole SubmitAttestation with
+      indexCid = b.indexCid
+      barSerial = "BAR-POR-1"
+      payload = AuditResultPayload with findingsHash = "por-pass", passed = True
+      evidenceHash = "por-ev-1"
+      deviceId = None
+  porCid <- submit p.complianceProvider do
+    createCmd ProofOfReserveCheck with
+      provider = p.complianceProvider
+      custodian = p.custodian
+      configCid = b.configCid
+      indexCid = idx1
+      backingSerials = ["BAR-POR-1"]
+  res <- submit p.custodian do
+    exerciseCmd (toInterfaceContractId @ComplianceCheck porCid) Validate with subject = p.custodian, amount = 1.0
+  assertMsg "proof of reserve passes on fresh passed audit" (res == CheckPassed)
+
+-- | ProofOfReserveCheck fails when the latest AuditResult attestation reports
+-- passed = False, even though it is perfectly fresh (semantic, not age, failure).
+testProofOfReserveFailsOnFailedAudit = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  auditorRole <- appoint b p.auditor Auditor "Zurich-A" (days 30)
+  (_auditAttCid, idx1) <- submit p.auditor do
+    exerciseCmd auditorRole SubmitAttestation with
+      indexCid = b.indexCid
+      barSerial = "BAR-POR-2"
+      payload = AuditResultPayload with findingsHash = "por-fail", passed = False
+      evidenceHash = "por-ev-2"
+      deviceId = None
+  porCid <- submit p.complianceProvider do
+    createCmd ProofOfReserveCheck with
+      provider = p.complianceProvider
+      custodian = p.custodian
+      configCid = b.configCid
+      indexCid = idx1
+      backingSerials = ["BAR-POR-2"]
+  res <- submit p.custodian do
+    exerciseCmd (toInterfaceContractId @ComplianceCheck porCid) Validate with subject = p.custodian, amount = 1.0
+  assertMsg "proof of reserve fails when the audit itself did not pass" (res /= CheckPassed)
+
+-- | ProofOfReserveCheck also fails on plain staleness (age beyond
+-- proofOfReserveMaxAge), independent of the semantic passed flag.
+testProofOfReserveFailsOnStaleness = script do
+  p <- allocateParties
+  setTime (time (date 2026 Jan 1) 0 0 0)
+  b <- bootstrapSystem p defaultSystemParams
+  auditorRole <- appoint b p.auditor Auditor "Zurich-A" (days 30)
+  (_auditAttCid, idx1) <- submit p.auditor do
+    exerciseCmd auditorRole SubmitAttestation with
+      indexCid = b.indexCid
+      barSerial = "BAR-POR-3"
+      payload = AuditResultPayload with findingsHash = "por-stale", passed = True
+      evidenceHash = "por-ev-3"
+      deviceId = None
+  porCid <- submit p.complianceProvider do
+    createCmd ProofOfReserveCheck with
+      provider = p.complianceProvider
+      custodian = p.custodian
+      configCid = b.configCid
+      indexCid = idx1
+      backingSerials = ["BAR-POR-3"]
+  -- proofOfReserveMaxAge defaults to 7 days.
+  passTime (days 8)
+  res <- submit p.custodian do
+    exerciseCmd (toInterfaceContractId @ComplianceCheck porCid) Validate with subject = p.custodian, amount = 1.0
+  assertMsg "proof of reserve fails once the attestation ages past proofOfReserveMaxAge" (res /= CheckPassed)
 
 -- | Data-driven checks: same Escrow template, different check lists.
 -- Asserts Escrow.daml needs zero changes when adding PresenceFreshnessCheck to the list.

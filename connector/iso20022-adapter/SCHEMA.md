@@ -103,7 +103,15 @@ attachments present in the full ISO 20022 setr.012 message.
   `setr012-<contractId>.xml`, one message per file, written atomically via a
   single `writeFile` call.
 - **Inbound** (`inbox/`): any `*.xml` file is treated as a setr.010 order.
-  After a successful ledger submission the file is moved to
-  `inbox/processed/` so it is never re-submitted.
+  Before submission, the file is moved from the inbox root to
+  `inbox/processing/`; it never sits in the inbox root while a ledger
+  submission is in flight, which is what prevents a double-submit if the
+  process crashes mid-scan. On success it moves to `inbox/processed/`; on
+  any failure (missing a required tag per the light structural check above,
+  a parse error, or a ledger submit error) it moves to `inbox/failed/` for
+  manual review instead of being retried automatically.
+- `Iso20022Adapter.processInboxOnce()` calls are serialized: an overlapping
+  call while a scan is already in flight joins that scan's result rather
+  than starting a second, concurrent pass over the same inbox listing.
 - Directory locations come from `config.connectors.iso20022.{inboxDir,outboxDir}`
   (see `config/localnet.yaml`) — never hardcoded in the adapter itself.

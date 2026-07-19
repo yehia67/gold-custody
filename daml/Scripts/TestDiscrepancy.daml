@@ -54,7 +54,7 @@ testCustodianCannotUnilaterallyResolve = script do
   setTime (time (date 2026 Jan 1) 0 0 0)
   b <- bootstrapSystem p defaultSystemParams
   fx <- setupDiscrepancyFixture b b.discrepancyIndexCid b.indexCid "BAR-DISC-1"
-  (reportCid, _idx) <- submit p.auditor do
+  (reportCid, idx) <- submit p.auditor do
     exerciseCmd fx.authorityCid FileDiscrepancy with
       vaultSite = "Zurich-A"
       affectedSerials = ["BAR-DISC-1"]
@@ -63,11 +63,11 @@ testCustodianCannotUnilaterallyResolve = script do
   -- MarkResolved is jointly controlled by custodian, auditor — custodian alone
   -- (or auditor alone) cannot unilaterally resolve.
   submitMustFail p.custodian do
-    exerciseCmd reportCid MarkResolved
+    exerciseCmd reportCid MarkResolved with discrepancyIndexCid = idx
   submitMustFail p.auditor do
-    exerciseCmd reportCid MarkResolved
+    exerciseCmd reportCid MarkResolved with discrepancyIndexCid = idx
   resolved <- submitMulti [p.custodian, p.auditor] [] do
-    exerciseCmd reportCid MarkResolved
+    exerciseCmd reportCid MarkResolved with discrepancyIndexCid = idx
   Some report <- queryContractId p.custodian resolved
   assertMsg "jointly resolved" report.resolved
 
@@ -177,11 +177,12 @@ testEscrowBlockedWhileDiscrepancyOpen = script do
   submitMultiMustFail [p.investor1, p.cashIssuer] [p.custodian] do
     exerciseCmd esc1 Settle
 
-  -- Resolve the discrepancy report, freeing the vault site.
+  -- Resolve the discrepancy report, freeing the vault site. MarkResolved now
+  -- marks the index entry itself, so there is no separate manual
+  -- MarkEntryResolved step; look up the resulting index cid via query.
   _ <- submitMulti [p.custodian, p.auditor] [] do
-    exerciseCmd reportCid MarkResolved
-  idxResolved <- submit p.custodian do
-    exerciseCmd idxOpen MarkEntryResolved with reportCid
+    exerciseCmd reportCid MarkResolved with discrepancyIndexCid = idxOpen
+  [(idxResolved, _)] <- query @DiscrepancyIndex p.custodian
 
   noOpenCheckResolved <- submit p.complianceProvider do
     createCmd NoOpenDiscrepancyCheck with

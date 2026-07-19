@@ -1,7 +1,8 @@
 module Movement where
 
 import Attestations
-import Operators (OperatorRole, OperatorType(..))
+import Config (SystemConfig, fetchParams)
+import Operators (OperatorRole, OperatorType(..), Permission(AttestPresence))
 
 data MovementState = Requested | Released | Received | Reconciled
   deriving (Eq, Show)
@@ -24,7 +25,7 @@ template WeightConfirmationAuthority
     custodian : Party
     weighmasterRoleCid : ContractId OperatorRole
     weighDeviceRoleCid : ContractId OperatorRole
-    configToleranceGrams : Decimal
+    configCid : ContractId SystemConfig
   where
     signatory custodian
 
@@ -35,6 +36,7 @@ template WeightConfirmationAuthority
         location : Text
       controller custodian
       do
+        params <- fetchParams configCid
         humanRole <- fetch weighmasterRoleCid
         deviceRole <- fetch weighDeviceRoleCid
         assertMsg "First role must be Weighmaster" (humanRole.role == Weighmaster)
@@ -53,7 +55,7 @@ template WeightConfirmationAuthority
               WeightPayload w -> w
               _ -> error "expected WeightPayload"
         let diff = if humanW >= deviceW then humanW - deviceW else deviceW - humanW
-        assertMsg "Weight mismatch beyond tolerance" (diff <= configToleranceGrams)
+        assertMsg "Weight mismatch beyond tolerance" (diff <= params.weightMatchToleranceGrams)
         now <- getTime
         create ConfirmedWeight with
           custodian
@@ -82,12 +84,14 @@ template BarMovement
     -- BarMovement doesn't even hold that field) so MovementCheck sees the new state.
     choice ReleaseBar : (ContractId BarMovement, ContractId MovementIndex)
       with
+        actor : Party
         movementIndexCid : ContractId MovementIndex
-      controller custodian
+      controller custodian, actor
       do
         assertMsg "Must be Requested" (state == Requested)
         vk <- fetch vaultKeeperRoleCid
         assertMsg "Release requires VaultKeeper role type" (vk.role == VaultKeeper)
+        assertMsg "actor must match VaultKeeper operator" (actor == vk.operator)
         mv <- create this with state = Released
         newIdx <- exercise movementIndexCid UpsertMovement with serial = barSerial, mvCid = mv, st = Released
         pure (mv, newIdx)
@@ -95,12 +99,14 @@ template BarMovement
     choice ReceiveBar : (ContractId BarMovement, ContractId MovementIndex)
       with
         actorRoleCid : ContractId OperatorRole
+        actor : Party
         movementIndexCid : ContractId MovementIndex
-      controller custodian
+      controller custodian, actor
       do
         assertMsg "Must be Released" (state == Released)
         role <- fetch actorRoleCid
         assertMsg "Receive requires Transporter role type" (role.role == Transporter)
+        assertMsg "actor must match Transporter operator" (actor == role.operator)
         mv <- create this with state = Received
         newIdx <- exercise movementIndexCid UpsertMovement with serial = barSerial, mvCid = mv, st = Received
         pure (mv, newIdx)
@@ -121,10 +127,12 @@ template BarMovement
         role <- fetch actorRoleCid
         assertMsg "actorRoleCid operator mismatch" (role.operator == actor)
         assertMsg "Reconcile requires VaultKeeper role type" (role.role == VaultKeeper)
+        now <- getTime
+        assertMsg "actorRoleCid expired" (now <= role.validUntil)
+        assertMsg "actorRoleCid lacks AttestPresence permission" (AttestPresence `elem` role.permissions)
         cw <- fetch confirmedWeightCid
         assertMsg "ConfirmedWeight serial mismatch" (cw.barSerial == barSerial)
         assertMsg "ConfirmedWeight location must be destination" (cw.location == toLocation)
-        now <- getTime
         attCid <- create Attestation with
           attestor = role.operator
           custodian

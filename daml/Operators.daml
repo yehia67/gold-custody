@@ -122,6 +122,8 @@ template CustodianRole
         validFor : RelTime
       controller custodian
       do
+        assertMsg "permissions must be a subset of the role's default permissions"
+          (all (\perm -> perm `elem` defaultPermissions role) permissions)
         now <- getTime
         create OperatorRole with
           custodian

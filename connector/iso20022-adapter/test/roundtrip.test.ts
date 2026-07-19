@@ -49,7 +49,8 @@ describe("iso20022-adapter round trip: file in -> ledger settle -> confirmation 
     // Step 1: file in.
     const processed = await adapter.processInboxOnce();
     expect(processed).toEqual(["order-1.xml"]);
-    expect(readdirSync(inboxDir)).toEqual(["processed"]);
+    expect(readdirSync(inboxDir).sort()).toEqual(["processed", "processing"]);
+    expect(readdirSync(join(inboxDir, "processing"))).toEqual([]);
     expect(readdirSync(join(inboxDir, "processed"))).toEqual(["order-1.xml"]);
 
     // Step 2: ledger command was actually submitted.

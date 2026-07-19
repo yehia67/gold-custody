@@ -28,6 +28,7 @@ export function makeTestConfig(overrides: Partial<GoldCustodyConfig> = {}, evide
       grpcHost: "localhost",
       grpcPort: 6865,
       cnQuickstartPath: "../cn-quickstart",
+      mode: "mock",
     },
     business: {
       minPurity: "0.995",
@@ -45,8 +46,18 @@ export function makeTestConfig(overrides: Partial<GoldCustodyConfig> = {}, evide
       navPublishIntervalSeconds: 60,
     },
     connectors: {
-      navPublisher: { port: 8101, xauSources: [] },
-      attestationService: { port: 0, evidenceStore },
+      navPublisher: {
+        port: 8101,
+        host: "127.0.0.1",
+        xauSources: [{ type: "fixture", name: "fixture-primary", value: "2650.00" }],
+      },
+      attestationService: {
+        port: 0,
+        host: "127.0.0.1",
+        evidenceStore,
+        apiKey: "test-api-key",
+        weightCosignTtlSeconds: 3600,
+      },
       iso20022: { inboxDir: "./inbox", outboxDir: "./outbox" },
     },
     configDir: "/tmp",

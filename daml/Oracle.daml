@@ -73,11 +73,17 @@ template DivergentPriceProposal
     choice ConfirmDivergentPrice : (ContractId PricePoint, ContractId PriceIndex)
       with
         observers : [Party]
+        confirmerRoleCid : ContractId OperatorRole
       controller confirmer, custodian
       do
         assertMsg "Confirmer must differ from proposer" (confirmer /= proposer)
+        confirmerRole <- fetch confirmerRoleCid
+        assertMsg "confirmerRoleCid operator mismatch" (confirmerRole.operator == confirmer)
+        assertMsg "Confirmer must be OracleOperator" (confirmerRole.role == OracleOperator)
+        assertMsg "Confirmer must have PublishOracle permission" (PublishOracle `elem` confirmerRole.permissions)
         params <- fetchParams configCid
         now <- getTime
+        assertMsg "confirmerRoleCid expired" (now <= confirmerRole.validUntil)
         pp <- create PricePoint with
           publisher = proposer
           value
@@ -172,6 +178,9 @@ template OraclePublishAuthority
         role <- fetch roleCid
         assertMsg "roleCid operator mismatch" (role.operator == operator)
         assertMsg "Must be OracleOperator" (role.role == OracleOperator)
+        assertMsg "Must have PublishOracle permission" (PublishOracle `elem` role.permissions)
+        now <- getTime
+        assertMsg "Role expired" (now <= role.validUntil)
         idx <- fetch priceIndexCid
         prevCid <- case idx.latestCid of
           Some c -> pure c
@@ -226,13 +235,12 @@ template NavPublishAuthority
           validUntil = addRelTime now params.navValidity
           observers
 
--- | Absolute divergence in basis points: |a-b|/a * 10000
+-- | Absolute divergence in basis points: |a-b|/a * 10000.
+-- Uses ceiling (not floor) so a divergence that is only fractionally over a
+-- threshold in bps is never silently rounded down into compliance.
 divergenceBps : Decimal -> Decimal -> Int
 divergenceBps old new =
   let diff = if new >= old then new - old else old - new
       ratio = diff / old
       bps = ratio * 10000.0
-  in intPart bps
-
-intPart : Decimal -> Int
-intPart d = floor d
+  in ceiling bps
